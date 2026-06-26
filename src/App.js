@@ -415,8 +415,6 @@ export default function App() {
         <div className="topbar-inner">
           <div className="topbar-icon"><Ico.Network /></div>
           <span className="topbar-title">Acquia DNS Finder</span>
-          <div className="topbar-sep" />
-          <span className="topbar-sub">T1 Repointing Checker</span>
           <div className="topbar-right">
             <div className="live-badge"><span className="live-dot" />Live</div>
             <span className="topbar-tag">Internal</span>

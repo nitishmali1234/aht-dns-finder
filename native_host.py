@@ -44,8 +44,11 @@ def strip_ansi(text):
 
 def run_cmd(cmd):
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=False, timeout=30)
-        return strip_ansi(result.stdout or result.stderr)
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=False, timeout=60)
+        output = result.stdout if result.stdout.strip() else result.stderr
+        return strip_ansi(output)
+    except subprocess.TimeoutExpired:
+        return "Error: aht command timed out after 60 seconds. Check your VPN connection."
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -147,17 +150,21 @@ def parse_domain_list_output(output):
 
 def detect_invalid_docroot(output, envs):
     if not output or not output.strip():
-        return True, "No output returned - the application name may not exist."
+        return True, "No output returned — the application name may not exist."
+    # Subprocess errors (timeout, path issues) are prefixed with "Error:"
+    if output.startswith("Error:"):
+        return True, output
     ol = output.lower()
     for pattern, msg in [
-        ("could not find application", "Application not found in AHT"),
-        ("application not found",      "Application not found in AHT"),
-        ("no such application",        "Application does not exist"),
-        ("unknown application",        "Unknown application name"),
-        ("does not exist",             "Application does not exist"),
-        ("no docroot",                 "Docroot not found"),
-        ("invalid docroot",            "Invalid docroot name"),
-        ("error: unknown",             "AHT returned an unknown error"),
+        ("could not find application", "Application not found in AHT. Check the docroot name."),
+        ("application not found",      "Application not found in AHT. Check the docroot name."),
+        ("no such application",        "Application does not exist."),
+        ("unknown application",        "Unknown application name."),
+        ("does not exist",             "Application does not exist."),
+        ("no docroot",                 "Docroot not found."),
+        ("invalid docroot",            "Invalid docroot name."),
+        ("timed out",                  "aht timed out — check your VPN connection and try again."),
+        ("error: unknown",             "AHT returned an unknown error."),
     ]:
         if pattern in ol:
             return True, msg
@@ -196,10 +203,15 @@ def handle_full_check(username):
     dc_output = run_cmd(["aht", f"@{username}", "dc"])
     domains = parse_dc_output(dc_output)
 
-    prod     = [d for d in domains if d['env'] == 'prod']
-    nonprod  = [d for d in domains if d['env'] != 'prod']
-    prod_ok  = all(d['matches'] or d['status'] in ['ok_a','ok_cname'] for d in prod)    if prod    else True
-    nprod_ok = all(d['matches'] or d['status'] in ['ok_a','ok_cname'] for d in nonprod) if nonprod else True
+    # Only count environments that app:info knows about — filters out [vcs], [svn], etc.
+    known_envs = set(envs.keys())
+    prod    = [d for d in domains if d['env'] == 'prod']
+    nonprod = [d for d in domains if d['env'] != 'prod' and d['env'] in known_envs]
+
+    # CDN domains (cloudflare/akamai) can't be IP-matched but aren't a repointing failure
+    OK_STATUSES = {'ok_a', 'ok_cname', 'cloudflare', 'cloudflare_ns', 'akamai'}
+    prod_ok  = all(d['matches'] or d['status'] in OK_STATUSES for d in prod)    if prod    else True
+    nprod_ok = all(d['matches'] or d['status'] in OK_STATUSES for d in nonprod) if nonprod else True
 
     issues, warnings = [], []
     if not prod_ok  and prod:    issues.append("Production domains have NOT been repointed")
@@ -225,7 +237,7 @@ def handle_full_check(username):
         'summary': {
             'all_repointed': prod_ok and nprod_ok,
             'prod_repointed': prod_ok, 'non_prod_repointed': nprod_ok,
-            'total_domains': len(domains),
+            'total_domains': len(prod) + len(nonprod),
             'prod_domains_count': len(prod), 'non_prod_domains_count': len(nonprod),
             'issues': issues, 'warnings': warnings,
             'cdn_detected': len(cdn_domains) > 0,
