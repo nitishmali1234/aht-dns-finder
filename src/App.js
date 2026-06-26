@@ -2,20 +2,10 @@
 import { useState, useEffect, useRef } from "react";
 import "./App.css";
 
-/* ─── API constants ──────────────────────────────────────────────────────── */
+/* ─── Constants ──────────────────────────────────────────────────────────── */
+const CF_DNS = "https://cloudflare-dns.com/dns-query";
 
-const ACQUIA_API  = "https://cloud.acquia.com/api";
-const CF_DNS      = "https://cloudflare-dns.com/dns-query";
-
-/* ─── Token cache ────────────────────────────────────────────────────────── */
-
-let _token   = null;
-let _tokenExp = 0;
-
-/* ─── Background service worker bridge ──────────────────────────────────── */
-// All Acquia auth requests go through the service worker so the Origin header
-// is "chrome-extension://..." rather than a page origin — Acquia may allow it.
-
+/* ─── Background bridge ──────────────────────────────────────────────────── */
 function bgMsg(payload) {
   return new Promise((resolve, reject) =>
     chrome.runtime.sendMessage(payload, r => {
@@ -25,238 +15,101 @@ function bgMsg(payload) {
   );
 }
 
-function parseAuthResp(resp) {
-  if (!resp) throw new Error("No response from background worker.");
-  let data = {};
-  try { data = JSON.parse(resp.body || "{}"); } catch {}
-  if (!resp.ok || !data.access_token) {
-    const msg = data.error_description || data.message || data.error || resp.body || String(resp.status);
-    throw new Error(`Auth failed (${resp.status}): ${msg}`);
+/* ─── Acquia Cloud API (uses cloud.acquia.com session via tab injection) ─── */
+async function acqGet(path) {
+  const resp = await bgMsg({ type: 'ACQUIA_API_CALL', endpoint: path });
+  if (!resp) throw new Error('No response from background worker.');
+  if (resp.error === 'NOT_LOGGED_IN' || resp.error === 'NO_TOKEN') throw new Error('NOT_LOGGED_IN');
+  if (resp.error) throw new Error(resp.error);
+  if (!resp.ok) {
+    let body = resp.body || '';
+    try { const j = JSON.parse(body); body = j.message || j.detail || j.error || body; } catch {}
+    throw new Error(`Acquia API (${resp.status}): ${body || 'Unknown error'}`);
   }
-  return data;
+  return JSON.parse(resp.body);
 }
 
-async function authViaBackground(clientId, clientSecret) {
-  const resp   = await bgMsg({ type: "ACQUIA_AUTH", clientId, clientSecret });
-  const data   = parseAuthResp(resp);
-  const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
-  await new Promise(ok => chrome.storage.local.set({
-    acquia_client_id:     clientId,
-    acquia_client_secret: clientSecret,
-    acquia_token:         data.access_token,
-    acquia_token_exp:     expiry,
-    acquia_refresh:       data.refresh_token ?? null,
-  }, ok));
-  _token    = data.access_token;
-  _tokenExp = expiry;
-  return _token;
-}
-
-async function refreshViaBackground(clientId, refreshTok) {
-  const resp   = await bgMsg({ type: "ACQUIA_REFRESH", clientId, refreshToken: refreshTok });
-  const data   = parseAuthResp(resp);
-  const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
-  await new Promise(ok => chrome.storage.local.set({
-    acquia_token:     data.access_token,
-    acquia_token_exp: expiry,
-    acquia_refresh:   data.refresh_token ?? refreshTok,
-  }, ok));
-  _token    = data.access_token;
-  _tokenExp = expiry;
-  return _token;
-}
-
-/* ─── PKCE Authorization Code flow ──────────────────────────────────────── */
-
-function b64url(buf) {
-  return btoa(String.fromCharCode(...new Uint8Array(buf)))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-}
-
-async function generatePKCE() {
-  const arr = new Uint8Array(32);
-  crypto.getRandomValues(arr);
-  const verifier  = b64url(arr.buffer);
-  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
-  return { verifier, challenge };
-}
-
-const ACQUIA_AUTH_URL = 'https://id.acquia.com/oauth2/default/v1/authorize';
-
-async function launchPKCE(clientId) {
-  const { verifier, challenge } = await generatePKCE();
-  const redirectUri = chrome.identity.getRedirectURL();
-  const authUrl = ACQUIA_AUTH_URL + '?' + new URLSearchParams({
-    response_type:         'code',
-    client_id:             clientId,
-    redirect_uri:          redirectUri,
-    code_challenge:        challenge,
-    code_challenge_method: 'S256',
-    state:                 b64url(crypto.getRandomValues(new Uint8Array(8)).buffer),
-  });
-  const result = await new Promise((resolve, reject) =>
-    chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, url => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else if (!url) reject(new Error("Authorization was cancelled."));
-      else resolve(url);
-    })
-  );
-  const params = new URL(result).searchParams;
-  if (params.get('error')) throw new Error(params.get('error_description') || params.get('error'));
-  const code = params.get('code');
-  if (!code) throw new Error("No authorization code returned.");
-  return { code, verifier, redirectUri };
-}
-
-async function exchangePKCECode(clientId, code, codeVerifier, redirectUri) {
-  const resp = await bgMsg({ type: 'ACQUIA_CODE_EXCHANGE', clientId, code, codeVerifier, redirectUri });
-  return parseAuthResp(resp);
-}
-
-/* ─── Get token: memory → storage → refresh → re-auth → NEEDS_AUTH ──────── */
-
-async function getToken() {
-  if (_token && Date.now() < _tokenExp) return _token;
-
-  const stored = await new Promise(ok =>
-    chrome.storage.local.get(
-      ["acquia_token", "acquia_token_exp", "acquia_refresh",
-       "acquia_client_id", "acquia_client_secret"], ok
-    )
-  );
-
-  if (stored.acquia_token && stored.acquia_token_exp > Date.now() + 60_000) {
-    _token    = stored.acquia_token;
-    _tokenExp = stored.acquia_token_exp;
-    return _token;
-  }
-
-  if (stored.acquia_refresh && stored.acquia_client_id) {
-    try { return await refreshViaBackground(stored.acquia_client_id, stored.acquia_refresh); }
-    catch {}
-  }
-
-  if (stored.acquia_client_id && stored.acquia_client_secret) {
-    try { return await authViaBackground(stored.acquia_client_id, stored.acquia_client_secret); }
-    catch {}
-  }
-
-  throw new Error("NEEDS_AUTH");
-}
-
-
-/* ─── Acquia Cloud API helpers ───────────────────────────────────────────── */
-
-async function acqGet(token, path) {
-  let res;
+async function findApp(name) {
   try {
-    res = await fetch(`${ACQUIA_API}${path}`, {
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-    });
-  } catch (netErr) {
-    throw new Error(`Network error: ${netErr.message}`);
-  }
-  if (!res.ok) {
-    let body = "";
-    try { body = await res.text(); } catch {}
-    try {
-      const j = JSON.parse(body);
-      body = j.message || j.error || body;
-    } catch {}
-    throw new Error(`Acquia API error (${res.status}) on ${path}: ${body || res.statusText}`);
-  }
-  return res.json();
-}
-
-async function findApp(token, name) {
-  // Try exact filter first
-  try {
-    const d = await acqGet(token, `/applications?filter=hosting_id%3D${encodeURIComponent(name)}&sort=name`);
+    const d = await acqGet(`/applications?filter=hosting_id%3D${encodeURIComponent(name)}&sort=name`);
     const items = d._embedded?.items || [];
     if (items.length) return items[0];
-  } catch {}
-
-  // Fall back to listing first 100 and matching by docroot suffix
-  const d = await acqGet(token, "/applications?sort=name&limit=100");
+  } catch (e) {
+    if (e.message === 'NOT_LOGGED_IN') throw e;
+  }
+  const d = await acqGet('/applications?sort=name&limit=100');
   const all = d._embedded?.items || [];
   const match = all.find(a => {
-    const docroot = (a.hosting?.id || "").split(":").pop();
-    return docroot === name || (a.name || "").toLowerCase() === name.toLowerCase();
+    const docroot = (a.hosting?.id || '').split(':').pop();
+    return docroot === name || (a.name || '').toLowerCase() === name.toLowerCase();
   });
   if (match) return match;
   throw new Error(`Application "${name}" not found. Verify the docroot name.`);
 }
 
-async function getEnvs(token, appUuid) {
-  const d = await acqGet(token, `/applications/${appUuid}/environments`);
+async function getEnvs(appUuid) {
+  const d = await acqGet(`/applications/${appUuid}/environments`);
   return d._embedded?.items || [];
 }
 
-async function getEnvDomains(token, envUuid) {
+async function getEnvDomains(envUuid) {
   try {
-    const d = await acqGet(token, `/environments/${envUuid}/domains`);
-    return (d._embedded?.items || [])
-      .map(i => i.hostname || i.name || i.domain)
-      .filter(Boolean);
+    const d = await acqGet(`/environments/${envUuid}/domains`);
+    return (d._embedded?.items || []).map(i => i.hostname || i.name || i.domain).filter(Boolean);
   } catch { return []; }
 }
 
 /* ─── DNS-over-HTTPS (Cloudflare 1.1.1.1) ───────────────────────────────── */
-
 async function resolveDomain(domain) {
   const [aData, cData] = await Promise.all([
-    fetch(`${CF_DNS}?name=${encodeURIComponent(domain)}&type=A`,     { headers: { Accept: "application/dns-json" } }).then(r => r.json()).catch(() => null),
-    fetch(`${CF_DNS}?name=${encodeURIComponent(domain)}&type=CNAME`, { headers: { Accept: "application/dns-json" } }).then(r => r.json()).catch(() => null),
+    fetch(`${CF_DNS}?name=${encodeURIComponent(domain)}&type=A`,     { headers: { Accept: 'application/dns-json' } }).then(r => r.json()).catch(() => null),
+    fetch(`${CF_DNS}?name=${encodeURIComponent(domain)}&type=CNAME`, { headers: { Accept: 'application/dns-json' } }).then(r => r.json()).catch(() => null),
   ]);
   const ips    = (aData?.Answer || []).filter(a => a.type === 1).map(a => a.data);
   const cnames = [
-    ...(aData?.Answer  || []).filter(a => a.type === 5),
-    ...(cData?.Answer  || []).filter(a => a.type === 5),
-  ].map(a => a.data.replace(/\.$/, "")).filter((v, i, arr) => arr.indexOf(v) === i);
+    ...(aData?.Answer || []).filter(a => a.type === 5),
+    ...(cData?.Answer || []).filter(a => a.type === 5),
+  ].map(a => a.data.replace(/\.$/, '')).filter((v, i, arr) => arr.indexOf(v) === i);
   return { ips, cnames };
 }
 
 function dnsStatus(ips, cnames, expectedIPs) {
-  if (!ips.length && !cnames.length) return "no_dns";
-  if (expectedIPs.length && ips.some(ip => expectedIPs.includes(ip))) return "ok_a";
-  const all = [...ips, ...cnames].join(" ").toLowerCase();
-  if (all.includes("cloudflare") || cnames.some(c => /\.cloudflare\.net$/.test(c))) return "cloudflare";
-  if (all.includes("akamai") || all.includes("edgekey") || all.includes("akamaiedge"))  return "akamai";
-  if (all.includes("fastly")) return "fastly";
-  if (cnames.some(c => c.includes("acquia-sites") || c.includes("acquia.com"))) return "ok_cname";
-  if (cnames.length) return "cname_other";
-  if (ips.length)    return "not_pointing";
-  return "no_dns";
+  if (!ips.length && !cnames.length) return 'no_dns';
+  if (expectedIPs.length && ips.some(ip => expectedIPs.includes(ip))) return 'ok_a';
+  const all = [...ips, ...cnames].join(' ').toLowerCase();
+  if (all.includes('cloudflare') || cnames.some(c => /\.cloudflare\.net$/.test(c))) return 'cloudflare';
+  if (all.includes('akamai') || all.includes('edgekey') || all.includes('akamaiedge'))  return 'akamai';
+  if (all.includes('fastly')) return 'fastly';
+  if (cnames.some(c => c.includes('acquia-sites') || c.includes('acquia.com'))) return 'ok_cname';
+  if (cnames.length) return 'cname_other';
+  if (ips.length)    return 'not_pointing';
+  return 'no_dns';
 }
 
 /* ─── Main check ─────────────────────────────────────────────────────────── */
-
-const OK_STATUSES = new Set(["ok_a", "ok_cname", "cloudflare", "akamai", "fastly"]);
+const OK_STATUSES = new Set(['ok_a', 'ok_cname', 'cloudflare', 'akamai', 'fastly']);
 
 async function performCheck(appName, onStep) {
   onStep(0);
-  const token = await getToken();
+  const app     = await findApp(appName);
+  const envList = await getEnvs(app.uuid);
 
   onStep(1);
-  const app     = await findApp(token, appName);
-  const envList = await getEnvs(token, app.uuid);
-
-  onStep(2);
   const envDomainsList = await Promise.all(
-    envList.map(env => getEnvDomains(token, env.uuid || env.id))
+    envList.map(env => getEnvDomains(env.uuid || env.id))
   );
 
-  onStep(3);
-  // Flatten all domains for parallel DNS resolution
+  onStep(2);
   const tasks = [];
   envList.forEach((env, i) => {
     const expectedIPs = env.ips || [];
     envDomainsList[i].forEach(domain => {
-      if (domain.endsWith(".acquia-sites.com") || domain.endsWith(".acquia.com")) return;
+      if (domain.endsWith('.acquia-sites.com') || domain.endsWith('.acquia.com')) return;
       tasks.push({ env, domain, expectedIPs });
     });
   });
 
+  onStep(3);
   const dnsResults = await Promise.all(
     tasks.map(async ({ env, domain, expectedIPs }) => {
       const { ips, cnames } = await resolveDomain(domain);
@@ -273,33 +126,31 @@ async function performCheck(appName, onStep) {
     })
   );
 
-  // Group by environment
   const environments = envList.map(env => {
-    const domains    = dnsResults.filter(d => d.env === env.name);
-    const repointed  = domains.length === 0 || domains.every(d => OK_STATUSES.has(d.status));
+    const domains   = dnsResults.filter(d => d.env === env.name);
+    const repointed = domains.length === 0 || domains.every(d => OK_STATUSES.has(d.status));
     return {
       name:       env.name,
       label:      env.label || env.name,
       ips:        env.ips || [],
       primary_ip: (env.ips || [])[0] || null,
-      type:       env.type || (env.name === "prod" ? "production" : "non-production"),
+      type:       env.type || (env.name === 'prod' ? 'production' : 'non-production'),
       repointed,
       domains,
     };
   });
 
   const allRepointed = environments.every(e => e.repointed);
-  const cdnDomains   = dnsResults.filter(d => ["cloudflare", "akamai", "fastly"].includes(d.status));
+  const cdnDomains   = dnsResults.filter(d => ['cloudflare', 'akamai', 'fastly'].includes(d.status));
 
-  const issues   = environments
-    .filter(e => !e.repointed && e.domains.length > 0)
-    .map(e => `${e.label} domains have NOT been repointed`);
+  const issues   = environments.filter(e => !e.repointed && e.domains.length > 0)
+                               .map(e => `${e.label} domains have NOT been repointed`);
   const warnings = [];
   if (cdnDomains.length)
-    warnings.push(`${cdnDomains.length} domain(s) use a CDN — verify origin is pointing to the correct Acquia IP`);
+    warnings.push(`${cdnDomains.length} domain(s) use a CDN — verify origin points to the correct Acquia IP`);
   const uniqueIPs = new Set(environments.map(e => e.primary_ip).filter(Boolean));
   if (uniqueIPs.size > 1)
-    warnings.push("Different IPs across environments — share the correct IP per environment with the customer");
+    warnings.push('Different IPs across environments — share the correct IP per environment with the customer');
 
   return {
     customer:     appName,
@@ -314,16 +165,14 @@ async function performCheck(appName, onStep) {
 }
 
 /* ─── Scan steps ─────────────────────────────────────────────────────────── */
-
 const SCAN_STEPS = [
-  { label: "Authenticating with Acquia",  cmd: "POST accounts.acquia.com/api/auth/oauth/token"   },
-  { label: "Fetching application info",   cmd: "GET  cloud.acquia.com/api/applications/…/environments" },
-  { label: "Loading domain lists",        cmd: "GET  cloud.acquia.com/api/environments/…/domains" },
-  { label: "Resolving DNS records",       cmd: "Cloudflare DNS-over-HTTPS (1.1.1.1)"              },
+  { label: 'Reading Acquia session',    cmd: 'cloud.acquia.com — Okta session token'           },
+  { label: 'Fetching application info', cmd: 'GET cloud.acquia.com/api/applications/…/environments' },
+  { label: 'Loading domain lists',      cmd: 'GET cloud.acquia.com/api/environments/…/domains' },
+  { label: 'Resolving DNS records',     cmd: 'Cloudflare DNS-over-HTTPS (1.1.1.1)'             },
 ];
 
 /* ─── Icons ──────────────────────────────────────────────────────────────── */
-
 const Ico = {
   Network: () => (
     <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
@@ -366,10 +215,18 @@ const Ico = {
       <circle cx="7.5" cy="11" r="0.75" fill="currentColor"/>
     </svg>
   ),
-  Key: () => (
-    <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-      <circle cx="5.5" cy="7.5" r="3.5" stroke="currentColor" strokeWidth="1.3"/>
-      <path d="M8.5 7.5H14M12 5.5V7.5M14 5.5V7.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+  Google: () => (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <path d="M15.68 8.18c0-.57-.05-1.12-.14-1.64H8v3.1h4.3a3.67 3.67 0 0 1-1.6 2.41v2h2.58c1.51-1.4 2.4-3.44 2.4-5.87z" fill="#4285F4"/>
+      <path d="M8 16c2.16 0 3.97-.71 5.3-1.93l-2.58-2a4.8 4.8 0 0 1-2.72.76c-2.09 0-3.86-1.41-4.49-3.31H.85v2.07A8 8 0 0 0 8 16z" fill="#34A853"/>
+      <path d="M3.51 9.52A4.8 4.8 0 0 1 3.26 8c0-.53.09-1.04.25-1.52V4.41H.85A8 8 0 0 0 0 8c0 1.29.31 2.51.85 3.59l2.66-2.07z" fill="#FBBC05"/>
+      <path d="M8 3.18c1.18 0 2.23.4 3.07 1.2l2.3-2.3C11.97.79 10.16 0 8 0A8 8 0 0 0 .85 4.41L3.51 6.48C4.14 4.59 5.91 3.18 8 3.18z" fill="#EA4335"/>
+    </svg>
+  ),
+  ExternalLink: () => (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+      <path d="M5 2H2a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+      <path d="M7.5 1H11v3.5M11 1L5.5 6.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
     </svg>
   ),
   Settings: () => (
@@ -378,24 +235,12 @@ const Ico = {
       <path d="M7 1v1.5M7 11.5V13M1 7h1.5M11.5 7H13M2.6 2.6l1.1 1.1M10.3 10.3l1.1 1.1M2.6 11.4l1.1-1.1M10.3 3.7l1.1-1.1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
     </svg>
   ),
-  Chevron: () => (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-      <path d="M4 2.5L7.5 6L4 9.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
-    </svg>
-  ),
   List: () => (
     <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
       <path d="M4.5 3.5H11.5M4.5 6.5H11.5M4.5 9.5H11.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
       <circle cx="2" cy="3.5" r="0.8" fill="currentColor"/>
       <circle cx="2" cy="6.5" r="0.8" fill="currentColor"/>
       <circle cx="2" cy="9.5" r="0.8" fill="currentColor"/>
-    </svg>
-  ),
-  Terminal: () => (
-    <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
-      <rect x="1" y="1" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.3"/>
-      <path d="M3.5 4.5L6 6.5L3.5 8.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-      <path d="M7 8.5H9.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
     </svg>
   ),
   Server: () => (
@@ -409,7 +254,6 @@ const Ico = {
 };
 
 /* ─── ScanCard ───────────────────────────────────────────────────────────── */
-
 const ScanCard = ({ step, customer }) => (
   <div className="card">
     <div className="scan-card">
@@ -420,7 +264,7 @@ const ScanCard = ({ step, customer }) => (
       <div className="scan-divider" />
       <div className="scan-steps">
         {SCAN_STEPS.map((s, i) => {
-          const cls = i < step ? "step-done" : i === step ? "step-active" : "step-queue";
+          const cls = i < step ? 'step-done' : i === step ? 'step-active' : 'step-queue';
           return (
             <div key={i} className={`scan-step ${cls}`}>
               <div className="step-icon">
@@ -432,7 +276,7 @@ const ScanCard = ({ step, customer }) => (
                 <code className="step-cmd">{s.cmd}</code>
               </div>
               <div className="step-state">
-                {i < step ? "done" : i === step ? "running" : "queued"}
+                {i < step ? 'done' : i === step ? 'running' : 'queued'}
               </div>
             </div>
           );
@@ -443,20 +287,19 @@ const ScanCard = ({ step, customer }) => (
 );
 
 /* ─── StatusPill ─────────────────────────────────────────────────────────── */
-
 const StatusPill = ({ status }) => {
   const MAP = {
-    ok_a:        { label: "OK · A record",   cls: "sp-ok"      },
-    ok_cname:    { label: "OK · CNAME",      cls: "sp-ok"      },
-    cloudflare:  { label: "Cloudflare CDN",  cls: "sp-warn"    },
-    akamai:      { label: "Akamai CDN",      cls: "sp-warn"    },
-    fastly:      { label: "Fastly CDN",      cls: "sp-warn"    },
-    not_pointing:{ label: "Not pointing",    cls: "sp-error"   },
-    cname_other: { label: "CNAME (other)",   cls: "sp-neutral" },
-    no_dns:      { label: "No DNS entry",    cls: "sp-neutral" },
+    ok_a:        { label: 'OK · A record',  cls: 'sp-ok'      },
+    ok_cname:    { label: 'OK · CNAME',     cls: 'sp-ok'      },
+    cloudflare:  { label: 'Cloudflare CDN', cls: 'sp-warn'    },
+    akamai:      { label: 'Akamai CDN',     cls: 'sp-warn'    },
+    fastly:      { label: 'Fastly CDN',     cls: 'sp-warn'    },
+    not_pointing:{ label: 'Not pointing',   cls: 'sp-error'   },
+    cname_other: { label: 'CNAME (other)',  cls: 'sp-neutral' },
+    no_dns:      { label: 'No DNS entry',   cls: 'sp-neutral' },
   };
-  const c = MAP[status] ?? { label: status, cls: "sp-neutral" };
-  const dotCls = { "sp-ok":"d-ok","sp-error":"d-error","sp-warn":"d-warn","sp-neutral":"d-neutral" }[c.cls];
+  const c = MAP[status] ?? { label: status, cls: 'sp-neutral' };
+  const dotCls = { 'sp-ok':'d-ok','sp-error':'d-error','sp-warn':'d-warn','sp-neutral':'d-neutral' }[c.cls];
   return (
     <span className={`spill ${c.cls}`}>
       <span className={`dot ${dotCls}`} />{c.label}
@@ -465,14 +308,12 @@ const StatusPill = ({ status }) => {
 };
 
 /* ─── EnvBadge ───────────────────────────────────────────────────────────── */
-
 const EnvBadge = ({ env }) => {
-  const cls = { prod:"eb-prod", dev:"eb-dev", test:"eb-test", stage:"eb-stage", dev2:"eb-dev" }[env] ?? "eb-other";
+  const cls = { prod:'eb-prod', dev:'eb-dev', test:'eb-test', stage:'eb-stage', dev2:'eb-dev' }[env] ?? 'eb-other';
   return <span className={`ebadge ${cls}`}>{env}</span>;
 };
 
 /* ─── DomainTable ────────────────────────────────────────────────────────── */
-
 const DomainTable = ({ domains }) => (
   <div className="table-wrap">
     <table className="domain-table">
@@ -487,10 +328,10 @@ const DomainTable = ({ domains }) => (
           <tr key={i}>
             <td className="td-domain">{d.domain}</td>
             <td><StatusPill status={d.status} /></td>
-            <td className="td-ip">{d.expected_ip || "—"}</td>
-            <td className={`td-ip ${d.matches ? "td-ip-ok" : "td-ip-fail"}`}>{d.actual_ip || "—"}</td>
-            <td className="td-ip" style={{ fontSize:"0.68rem", maxWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-              {d.cname || "—"}
+            <td className="td-ip">{d.expected_ip || '—'}</td>
+            <td className={`td-ip ${d.matches ? 'td-ip-ok' : 'td-ip-fail'}`}>{d.actual_ip || '—'}</td>
+            <td className="td-ip" style={{ fontSize:'0.68rem', maxWidth:200, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+              {d.cname || '—'}
             </td>
             <td>
               {d.matches
@@ -505,19 +346,18 @@ const DomainTable = ({ domains }) => (
 );
 
 /* ─── StatusCard ─────────────────────────────────────────────────────────── */
-
 const StatusCard = ({ result }) => {
   const ok = result.all_repointed;
   return (
     <div className="card">
       <div className="status-banner">
         <div className="status-left">
-          <div className={`status-glyph ${ok ? "sg-ok" : "sg-error"}`}>
+          <div className={`status-glyph ${ok ? 'sg-ok' : 'sg-error'}`}>
             {ok ? <Ico.CheckCircle /> : <Ico.XCircle />}
           </div>
           <div>
             <div className="status-verdict">
-              {ok ? "DNS Repointing Complete" : "DNS Repointing Incomplete"}
+              {ok ? 'DNS Repointing Complete' : 'DNS Repointing Incomplete'}
             </div>
             <div className="status-meta">
               Customer: <code>{result.customer}</code>
@@ -530,8 +370,8 @@ const StatusCard = ({ result }) => {
         </div>
         <div className="status-chips">
           {result.environments.map(env => (
-            <div key={env.name} className={`status-chip ${env.repointed ? "chip-ok" : "chip-error"}`}>
-              <span className={`dot ${env.repointed ? "d-ok" : "d-error"}`} />
+            <div key={env.name} className={`status-chip ${env.repointed ? 'chip-ok' : 'chip-error'}`}>
+              <span className={`dot ${env.repointed ? 'd-ok' : 'd-error'}`} />
               {env.name} · <strong>{env.domains.length}</strong>
             </div>
           ))}
@@ -552,7 +392,6 @@ const StatusCard = ({ result }) => {
 };
 
 /* ─── EnvGrid ────────────────────────────────────────────────────────────── */
-
 const EnvGrid = ({ environments }) => (
   <div className="card">
     <div className="card-head">
@@ -560,17 +399,17 @@ const EnvGrid = ({ environments }) => (
     </div>
     <div className="env-grid">
       {environments.map(env => {
-        const typeTag = env.type === "production" ? "tag-dedicated" : "tag-shared";
+        const typeTag = env.type === 'production' ? 'tag-dedicated' : 'tag-shared';
         return (
-          <div key={env.name} className={`env-card ${env.repointed ? "env-card-ok" : "env-card-error"}`}>
+          <div key={env.name} className={`env-card ${env.repointed ? 'env-card-ok' : 'env-card-error'}`}>
             <div className="env-card-name">{env.name}</div>
             <div className="env-card-status">
-              <span className={`dot ${env.repointed ? "d-ok" : "d-error"}`} />
-              {env.repointed ? "Repointed" : "Not repointed"}
+              <span className={`dot ${env.repointed ? 'd-ok' : 'd-error'}`} />
+              {env.repointed ? 'Repointed' : 'Not repointed'}
             </div>
-            <div className="env-card-eip">{env.primary_ip || "—"}</div>
+            <div className="env-card-eip">{env.primary_ip || '—'}</div>
             <div className="env-card-bal">{env.label}</div>
-            <span className={`type-tag ${typeTag}`}>{env.type || "unknown"}</span>
+            <span className={`type-tag ${typeTag}`}>{env.type || 'unknown'}</span>
           </div>
         );
       })}
@@ -578,361 +417,122 @@ const EnvGrid = ({ environments }) => (
   </div>
 );
 
-/* ─── Settings / Connect page ────────────────────────────────────────────── */
-
-// phase: "form" | "trying" | "device_waiting" | "done"
-const SettingsPage = ({ onSave, clientId: existingId }) => {
-  const [clientId,     setClientId]     = useState(existingId || "");
-  const [clientSecret, setClientSecret] = useState("");
-  const [phase,        setPhase]        = useState("form");
-  const [statusMsg,    setStatusMsg]    = useState("");
-  const [deviceInfo,   setDeviceInfo]   = useState(null);
-  const [polls,        setPollCount]    = useState(0);
-  const [err,          setErr]          = useState(null);
-  const timerRef = useRef(null);
-
-  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
-
-  /* ── Device poll loop ── */
-  const schedulePoll = (id, deviceCode, intervalSec, deadline) => {
-    timerRef.current = setTimeout(async () => {
-      if (Date.now() > deadline) {
-        setErr("Code expired — click back and try again."); setPhase("form"); return;
-      }
-      setPollCount(n => n + 1);
-      const resp = await bgMsg({ type: "ACQUIA_DEVICE_POLL", clientId: id, deviceCode });
-      if (!resp) { schedulePoll(id, deviceCode, intervalSec, deadline); return; }
-      let d = {};
-      try { d = JSON.parse(resp.body); } catch {}
-
-      if (d.access_token) {
-        const expiry = Date.now() + ((d.expires_in ?? 7200) - 120) * 1000;
-        await new Promise(ok => chrome.storage.local.set({
-          acquia_client_id: id, acquia_token: d.access_token,
-          acquia_token_exp: expiry, acquia_refresh: d.refresh_token ?? null,
-        }, ok));
-        _token = d.access_token; _tokenExp = expiry;
-        onSave(id); return;
-      }
-      if (d.error === "authorization_pending") { schedulePoll(id, deviceCode, intervalSec, deadline); return; }
-      if (d.error === "slow_down")             { schedulePoll(id, deviceCode, intervalSec + 5, deadline); return; }
-      if (d.error === "expired_token")         { setErr("Code expired — try again."); setPhase("form"); return; }
-      if (d.error === "access_denied")         { setErr("Authorization denied."); setPhase("form"); return; }
-      if (d.error) { setErr(d.error_description || d.error); setPhase("form"); return; }
-      schedulePoll(id, deviceCode, intervalSec, deadline);
-    }, intervalSec * 1000);
-  };
-
-  /* ── Device flow start ── */
-  const startDeviceFlow = async (id) => {
-    setStatusMsg("Starting device authorization…");
-    const resp = await bgMsg({ type: "ACQUIA_DEVICE_START", clientId: id });
-    let d = {};
-    try { d = JSON.parse(resp?.body || "{}"); } catch {}
-    if (!resp?.ok || !d.device_code) {
-      const msg = d.error_description || d.error || resp?.body || `Status ${resp?.status}`;
-      throw new Error(msg);
-    }
-    setDeviceInfo(d);
-    setPhase("device_waiting");
-    schedulePoll(id, d.device_code, d.interval || 5, Date.now() + (d.expires_in || 300) * 1000);
-  };
-
-  /* ── "Try Again" after redirect URI registration — re-runs full cascade ── */
-  const tryAgain = () => connect();
-
-  /* ── Shared: save token data from any flow ── */
-  const saveToken = async (id, sec, data) => {
-    const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
-    await new Promise(ok => chrome.storage.local.set({
-      acquia_client_id:     id,
-      acquia_client_secret: sec || null,
-      acquia_token:         data.access_token,
-      acquia_token_exp:     expiry,
-      acquia_refresh:       data.refresh_token ?? null,
-    }, ok));
-    _token = data.access_token; _tokenExp = expiry;
-  };
-
-  /* ── Connect: tab-inject → client_creds (Okta) → device → PKCE ── */
-  const connect = async () => {
-    const id  = clientId.trim();
-    const sec = clientSecret.trim();
-    if (!id) { setErr("Enter your Acquia Client ID."); return; }
-    setErr(null); setPhase("trying");
-
-    /* 1. Inject into a cloud.acquia.com tab — Origin: cloud.acquia.com bypasses
-          Acquia's "browser request" check on accounts.acquia.com/api/auth/oauth/token */
-    if (sec) {
-      setStatusMsg("Connecting via Acquia Cloud…");
-      const resp = await bgMsg({ type: "ACQUIA_TAB_AUTH", clientId: id, clientSecret: sec });
-
-      if (resp?.body === 'NOT_LOGGED_IN') {
-        setErr("Please log in to cloud.acquia.com in any browser tab, then click Connect again.");
-        setPhase("form"); return;
-      }
-
-      try {
-        const data = parseAuthResp(resp);
-        await saveToken(id, sec, data);
-        onSave(id); return;
-      } catch {
-        /* tab auth failed for another reason — fall through */
-      }
-    }
-
-    /* 2. Direct client_credentials on Okta (works if Acquia ever enables it) */
-    if (sec) {
-      setStatusMsg("Trying API key auth…");
-      try {
-        await authViaBackground(id, sec);
-        onSave(id); return;
-      } catch (e) {
-        const wrongSecret = /\b401\b/.test(e.message) && !/pkce|proof key|unauthorized_client/i.test(e.message);
-        if (wrongSecret) { setErr(e.message); setPhase("form"); return; }
-      }
-    }
-
-    /* 3. Device Code flow */
-    setStatusMsg("Trying device flow…");
-    try { await startDeviceFlow(id); return; } catch { /* fall through */ }
-
-    /* 4. PKCE Authorization Code — browser popup */
-    setStatusMsg("Opening Acquia login…");
-    try {
-      const { code, verifier, redirectUri } = await launchPKCE(id);
-      setStatusMsg("Completing sign-in…");
-      const data = await exchangePKCECode(id, code, verifier, redirectUri);
-      await saveToken(id, sec, data);
-      onSave(id);
-    } catch (e) {
-      const isRedirectIssue = /could not be loaded|not approve|cancelled|closed/i.test(e.message);
-      if (isRedirectIssue) { setPhase("redirect_needed"); return; }
-      setErr(e.message); setPhase("form");
-    }
-  };
-
-  const goBack = () => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    setPhase("form"); setDeviceInfo(null); setErr(null); setPollCount(0);
-  };
-
-  /* ── Redirect URI setup guide ── */
-  const redirectUri = chrome.identity.getRedirectURL();
-  if (phase === "redirect_needed") return (
-    <div className="page">
-      <header className="topbar">
-        <div className="topbar-inner">
-          <div className="topbar-icon"><Ico.Network /></div>
-          <span className="topbar-title">Acquia DNS Finder</span>
-          <div className="topbar-right"><span className="topbar-tag">Setup</span></div>
-        </div>
-      </header>
-      <main className="main" style={{ maxWidth: 580 }}>
-        <div className="card">
-          <div className="card-head"><span className="card-head-label"><Ico.Key /> One-Time Setup Required</span></div>
-          <div className="card-body">
-            <p className="settings-intro">
-              The login popup opened but Acquia blocked the return URL. You need to register
-              this extension's callback URI in your Acquia API token — it's a one-time step.
+/* ─── NotAcquiaPage — shown when Chrome account isn't @acquia.com ─────────  */
+const NotAcquiaPage = ({ email }) => (
+  <div className="page">
+    <header className="topbar">
+      <div className="topbar-inner">
+        <div className="topbar-icon"><Ico.Network /></div>
+        <span className="topbar-title">Acquia DNS Finder</span>
+        <div className="topbar-right"><span className="topbar-tag">Internal</span></div>
+      </div>
+    </header>
+    <main className="main" style={{ maxWidth: 520 }}>
+      <div className="card">
+        <div className="card-body" style={{ textAlign: 'center', padding: '32px 24px' }}>
+          <div style={{ fontSize: 40, marginBottom: 16 }}>🔒</div>
+          <div style={{ fontWeight: 600, fontSize: '1rem', color: 'var(--t1)', marginBottom: 8 }}>
+            Acquia employees only
+          </div>
+          {email ? (
+            <p style={{ color: 'var(--t2)', fontSize: '0.85rem', lineHeight: 1.6 }}>
+              You're signed into Chrome as <strong>{email}</strong>.<br />
+              This extension requires an <strong>@acquia.com</strong> Google account.
             </p>
+          ) : (
+            <p style={{ color: 'var(--t2)', fontSize: '0.85rem', lineHeight: 1.6 }}>
+              Sign in to Chrome with your <strong>@acquia.com</strong> Google account to use this extension.
+            </p>
+          )}
+          <p style={{ color: 'var(--t3)', fontSize: '0.78rem', marginTop: 12 }}>
+            Open Chrome settings → You and Google → Sign in to Chrome
+          </p>
+        </div>
+      </div>
+    </main>
+  </div>
+);
 
-            <div className="auth-step-box">
-              <div className="auth-step-label">Step 1 — Copy this Callback URI</div>
-              <div className="auth-step-url" style={{ wordBreak:"break-all" }}>{redirectUri}</div>
-              <button className="btn-ghost" style={{ marginTop:10, fontSize:"0.78rem" }}
-                onClick={() => navigator.clipboard.writeText(redirectUri)}>
-                Copy to clipboard
-              </button>
-            </div>
-
-            <div className="auth-step-box" style={{ marginTop:14 }}>
-              <div className="auth-step-label">Step 2 — Add it to your Acquia API token</div>
-              <ol style={{ paddingLeft:18, lineHeight:1.9, fontSize:"0.84rem", color:"var(--t1)", marginTop:8 }}>
-                <li>Go to <strong>cloud.acquia.com</strong></li>
-                <li>Click your name (top-right) → <strong>Account settings</strong></li>
-                <li>Click <strong>API tokens</strong></li>
-                <li>Click your token name to edit it</li>
-                <li>Find the <strong>Callback URLs</strong> (or Redirect URIs) field</li>
-                <li>Paste the URI above and save</li>
-              </ol>
-            </div>
-
-            <button className="btn-primary" style={{ width:"100%", marginTop:18 }}
-              onClick={tryAgain}>
-              I've added it — Try Again
+/* ─── CloudLoginPrompt — inline card shown when cloud.acquia.com not open ── */
+const CloudLoginPrompt = ({ onRetry }) => (
+  <div className="card">
+    <div className="card-body">
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
+        <div style={{ fontSize: 28, lineHeight: 1 }}>🌐</div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 600, color: 'var(--t1)', marginBottom: 6 }}>
+            Open cloud.acquia.com first
+          </div>
+          <p style={{ color: 'var(--t2)', fontSize: '0.83rem', lineHeight: 1.6, margin: 0 }}>
+            The extension reads your existing Acquia Cloud session — no extra login needed.
+            Open cloud.acquia.com in any tab and sign in, then run the check again.
+          </p>
+          <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
+            <button className="btn-primary" style={{ fontSize: '0.8rem' }}
+              onClick={() => chrome.tabs.create({ url: 'https://cloud.acquia.com/' })}>
+              <Ico.ExternalLink /> Open cloud.acquia.com
             </button>
-            <button className="btn-ghost" style={{ width:"100%", marginTop:10 }} onClick={goBack}>
-              ← Back
+            <button className="btn-ghost" style={{ fontSize: '0.8rem' }} onClick={onRetry}>
+              Try again
             </button>
           </div>
         </div>
-      </main>
+      </div>
     </div>
-  );
-
-  /* ── Device waiting UI ── */
-  if (phase === "device_waiting" && deviceInfo) return (
-    <div className="page">
-      <header className="topbar">
-        <div className="topbar-inner">
-          <div className="topbar-icon"><Ico.Network /></div>
-          <span className="topbar-title">Acquia DNS Finder</span>
-          <div className="topbar-right"><span className="topbar-tag">Authorizing</span></div>
-        </div>
-      </header>
-      <main className="main" style={{ maxWidth: 560 }}>
-        <div className="card">
-          <div className="card-head"><span className="card-head-label"><Ico.Key /> Authorize in Acquia</span></div>
-          <div className="card-body">
-            <p className="settings-intro">
-              Open the link below and enter the code when prompted. The extension will connect automatically once you approve.
-            </p>
-
-            <div className="auth-step-box">
-              <div className="auth-step-label">Step 1 — Open this URL in your browser</div>
-              <div className="auth-step-url">{deviceInfo.verification_uri}</div>
-              <button className="btn-ghost" style={{ marginTop:10, fontSize:"0.78rem" }}
-                onClick={() => chrome.tabs.create({ url: deviceInfo.verification_uri_complete || deviceInfo.verification_uri })}>
-                Open in new tab →
-              </button>
-            </div>
-
-            <div className="auth-step-box" style={{ marginTop:14, textAlign:"center" }}>
-              <div className="auth-step-label">Step 2 — Enter this code</div>
-              <div className="auth-step-code">{deviceInfo.user_code}</div>
-            </div>
-
-            <div className="auth-step-status">
-              <span className="spin-light" />
-              Waiting for approval… <span style={{ color:"var(--t3)" }}>({polls} check{polls !== 1 ? "s" : ""})</span>
-            </div>
-
-            {err && <div className="alert alert-error" style={{ marginTop:14 }}><Ico.AlertTri />{err}</div>}
-            <button className="btn-ghost" style={{ width:"100%", marginTop:14 }} onClick={goBack}>← Back</button>
-          </div>
-        </div>
-      </main>
-    </div>
-  );
-
-  /* ── Main form ── */
-  const busy = phase === "trying";
-  return (
-    <div className="page">
-      <header className="topbar">
-        <div className="topbar-inner">
-          <div className="topbar-icon"><Ico.Network /></div>
-          <span className="topbar-title">Acquia DNS Finder</span>
-          <div className="topbar-right"><span className="topbar-tag">Setup</span></div>
-        </div>
-      </header>
-      <main className="main" style={{ maxWidth: 560 }}>
-        <div className="card">
-          <div className="card-head"><span className="card-head-label"><Ico.Key /> Connect Acquia Account</span></div>
-          <div className="card-body">
-            <p className="settings-intro">
-              Enter your Acquia API credentials. The extension tries API key auth first; if that's blocked it switches to a browser-based device flow automatically.
-            </p>
-
-            <div className="settings-field">
-              <label className="settings-field-label">Client ID</label>
-              <input className="settings-input" type="text"
-                placeholder="e62adfc6-c7ee-403b-ba40-172c90e792cf"
-                value={clientId} autoFocus
-                onChange={e => { setClientId(e.target.value); setErr(null); }}
-                onKeyDown={e => e.key === "Enter" && !busy && connect()} />
-            </div>
-
-            <div className="settings-field">
-              <label className="settings-field-label">Client Secret <span style={{ color:"var(--t3)", fontWeight:400 }}>(optional — for faster auth)</span></label>
-              <input className="settings-input" type="password"
-                placeholder="Leave blank to use browser-based login"
-                value={clientSecret}
-                onChange={e => { setClientSecret(e.target.value); setErr(null); }}
-                onKeyDown={e => e.key === "Enter" && !busy && connect()} />
-            </div>
-
-            {err && <div className="alert alert-error" style={{ marginBottom:14 }}><Ico.AlertTri />{err}</div>}
-
-            <button className="btn-primary" style={{ width:"100%" }} onClick={connect} disabled={busy}>
-              {busy ? <><span className="spin" />{statusMsg || "Connecting…"}</> : <>Connect with Acquia</>}
-            </button>
-
-            <div className="settings-how">
-              <strong style={{ color:"var(--t1)", display:"block", marginBottom:8 }}>How to find your credentials</strong>
-              <ol>
-                <li>Go to <strong>cloud.acquia.com</strong></li>
-                <li>Click your name (top-right) → <strong>Account settings</strong></li>
-                <li>Click <strong>API tokens</strong> → <strong>Create token</strong></li>
-                <li>Copy the <strong>Key</strong> (Client ID) and optionally the <strong>Secret</strong></li>
-              </ol>
-            </div>
-          </div>
-        </div>
-      </main>
-    </div>
-  );
-};
+  </div>
+);
 
 /* ─── App ────────────────────────────────────────────────────────────────── */
-
 export default function App() {
-  // undefined=loading, null=not connected, string=client_id (connected)
-  const [creds,    setCreds]    = useState(undefined);
-  const [customer, setCustomer] = useState("");
-  const [loading,  setLoading]  = useState(false);
-  const [scanStep, setScanStep] = useState(0);
-  const [result,   setResult]   = useState(null);
-  const [error,    setError]    = useState(null);
-  const [showSettings, setShowSettings] = useState(false);
+  // 'loading' | 'not_acquia' | 'ready'
+  const [authState, setAuthState] = useState('loading');
+  const [userEmail, setUserEmail] = useState('');
+  const [customer,  setCustomer]  = useState('');
+  const [loading,   setLoading]   = useState(false);
+  const [scanStep,  setScanStep]  = useState(0);
+  const [result,    setResult]    = useState(null);
+  const [error,     setError]     = useState(null);
+  const [needsCloud, setNeedsCloud] = useState(false);
+  const inputRef = useRef(null);
 
-  // Load token from Chrome storage on mount
+  /* ── Verify @acquia.com Google account on mount ── */
   useEffect(() => {
-    chrome.storage.local.get(
-      ["acquia_client_id", "acquia_client_secret", "acquia_token", "acquia_token_exp"],
-      ({ acquia_client_id, acquia_client_secret, acquia_token, acquia_token_exp }) => {
-        if (acquia_token && acquia_token_exp > Date.now() && acquia_client_id) {
-          _token    = acquia_token;
-          _tokenExp = acquia_token_exp;
-          setCreds(acquia_client_id);
-        } else if (acquia_client_id && acquia_client_secret) {
-          // Have credentials but token expired — mark as connected; getToken() will re-auth
-          setCreds(acquia_client_id);
-        } else {
-          setCreds(null);
-        }
+    chrome.identity.getProfileUserInfo(info => {
+      const email = info?.email || '';
+      setUserEmail(email);
+      if (email.endsWith('@acquia.com')) {
+        setAuthState('ready');
+      } else {
+        setAuthState('not_acquia');
       }
-    );
+    });
   }, []);
 
-  // Scan step animation
+  useEffect(() => {
+    if (authState === 'ready' && inputRef.current) inputRef.current.focus();
+  }, [authState]);
+
+  /* ── Scan step timing ── */
   useEffect(() => {
     if (!loading) { setScanStep(0); return; }
     const t = [
-      setTimeout(() => setScanStep(1), 1500),
-      setTimeout(() => setScanStep(2), 4000),
-      setTimeout(() => setScanStep(3), 7000),
+      setTimeout(() => setScanStep(1), 1200),
+      setTimeout(() => setScanStep(2), 3500),
+      setTimeout(() => setScanStep(3), 6000),
     ];
     return () => t.forEach(clearTimeout);
   }, [loading]);
 
-  const signOut = () => {
-    _token = null; _tokenExp = 0;
-    chrome.storage.local.remove(["acquia_client_id", "acquia_client_secret", "acquia_token", "acquia_token_exp", "acquia_refresh"]);
-    setCreds(null); setShowSettings(false); setResult(null); setError(null);
-  };
-
   const runCheck = async () => {
     const name = customer.trim();
-    if (!name) { setError("Enter an application name."); return; }
-    setLoading(true); setError(null); setResult(null);
+    if (!name) { setError('Enter an application name.'); return; }
+    setLoading(true); setError(null); setResult(null); setNeedsCloud(false);
     try {
       const data = await performCheck(name, setScanStep);
       setResult(data);
     } catch (e) {
-      if (e.message === "NEEDS_AUTH") {
-        setCreds(null); // token expired and refresh failed — re-login
+      if (e.message === 'NOT_LOGGED_IN') {
+        setNeedsCloud(true);
       } else {
         setError(e.message);
       }
@@ -941,20 +541,14 @@ export default function App() {
     }
   };
 
-  // Still checking storage
-  if (creds === undefined) return (
-    <div className="page" style={{ alignItems:"center", justifyContent:"center", display:"flex", height:"100vh" }}>
+  /* ── Render ── */
+  if (authState === 'loading') return (
+    <div className="page" style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'100vh' }}>
       <span className="spin-light" style={{ width:24, height:24, borderWidth:3 }} />
     </div>
   );
 
-  // Not connected yet, or user clicked "Reconnect"
-  if (creds === null || showSettings) return (
-    <SettingsPage
-      clientId={typeof creds === "string" ? creds : ""}
-      onSave={id => { setCreds(id); setShowSettings(false); }}
-    />
-  );
+  if (authState === 'not_acquia') return <NotAcquiaPage email={userEmail} />;
 
   return (
     <div className="page">
@@ -965,9 +559,7 @@ export default function App() {
           <div className="topbar-icon"><Ico.Network /></div>
           <span className="topbar-title">Acquia DNS Finder</span>
           <div className="topbar-right">
-            <button className="btn-ghost" onClick={signOut}>
-              <Ico.Settings />Reconnect
-            </button>
+            <span className="user-email">{userEmail}</span>
             <div className="live-badge"><span className="live-dot" />Live</div>
             <span className="topbar-tag">Internal</span>
           </div>
@@ -984,14 +576,14 @@ export default function App() {
               <div className="search-input-wrap">
                 <span className="search-prefix">&gt;</span>
                 <input
+                  ref={inputRef}
                   className="search-input"
                   type="text"
                   value={customer}
-                  onChange={e => { setCustomer(e.target.value); setError(null); setResult(null); }}
-                  onKeyDown={e => e.key === "Enter" && !loading && runCheck()}
+                  onChange={e => { setCustomer(e.target.value); setError(null); setResult(null); setNeedsCloud(false); }}
+                  onKeyDown={e => e.key === 'Enter' && !loading && runCheck()}
                   placeholder="iqstudent"
                   disabled={loading}
-                  autoFocus
                 />
               </div>
               <button className="btn-primary" onClick={runCheck} disabled={loading}>
@@ -1001,7 +593,6 @@ export default function App() {
             <p className="search-hint">
               Application name only — no "@" prefix, no ".prod" suffix. E.g. <code>iqstudent</code>
             </p>
-
             {!loading && error && (
               <div className="alert alert-error" style={{ marginTop: 14 }}>
                 <Ico.AlertTri />{error}
@@ -1010,6 +601,11 @@ export default function App() {
           </div>
         </div>
 
+        {/* ── Cloud login prompt ───────────────────────────────────────── */}
+        {needsCloud && (
+          <CloudLoginPrompt onRetry={() => { setNeedsCloud(false); runCheck(); }} />
+        )}
+
         {/* ── Scan animation ──────────────────────────────────────────── */}
         {loading && <ScanCard step={scanStep} customer={customer.trim()} />}
 
@@ -1017,10 +613,7 @@ export default function App() {
         {!loading && result && (
           <>
             <StatusCard result={result} />
-
             <EnvGrid environments={result.environments} />
-
-            {/* Domain check — one section per environment */}
             <div className="card">
               <div className="card-head">
                 <span className="card-head-label">
@@ -1029,17 +622,16 @@ export default function App() {
                 </span>
                 <span className="card-head-meta">Cloudflare DNS-over-HTTPS</span>
               </div>
-
               {result.environments.map(env => {
                 if (env.domains.length === 0) return null;
                 return (
                   <div key={env.name}>
                     <div className="domain-section-label">
-                      <span className={`dot ${env.repointed ? "d-ok" : "d-error"}`} />
+                      <span className={`dot ${env.repointed ? 'd-ok' : 'd-error'}`} />
                       <EnvBadge env={env.name} />
-                      <span style={{ color:"var(--t2)" }}>{env.domains.length} domain(s)</span>
+                      <span style={{ color:'var(--t2)' }}>{env.domains.length} domain(s)</span>
                       {env.primary_ip && (
-                        <code style={{ fontFamily:"var(--mono)", fontSize:"0.68rem", color:"var(--t3)" }}>
+                        <code style={{ fontFamily:'var(--mono)', fontSize:'0.68rem', color:'var(--t3)' }}>
                           → {env.primary_ip}
                         </code>
                       )}
@@ -1048,9 +640,8 @@ export default function App() {
                   </div>
                 );
               })}
-
               {result.environments.every(e => e.domains.length === 0) && (
-                <div className="card-body" style={{ color:"var(--t2)", fontSize:"0.82rem" }}>
+                <div className="card-body" style={{ color:'var(--t2)', fontSize:'0.82rem' }}>
                   No customer domains found for this application.
                 </div>
               )}

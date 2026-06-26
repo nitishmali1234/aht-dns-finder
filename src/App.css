@@ -585,6 +585,13 @@ pre.code-block {
 
 pre.code-block:last-child { margin-bottom: 0; }
 
+/* ── User email in topbar ─────────────────────────────────────────────────── */
+.user-email {
+  font-size: 0.7rem; color: var(--t3);
+  font-family: var(--mono); max-width: 180px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 /* ── Settings page ────────────────────────────────────────────────────────── */
 
 .settings-intro {
