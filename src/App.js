@@ -638,6 +638,28 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
     schedulePoll(id, d.device_code, d.interval || 5, Date.now() + (d.expires_in || 300) * 1000);
   };
 
+  /* ── Direct PKCE attempt (used after redirect URI has been registered) ── */
+  const tryPKCE = async (id) => {
+    if (!id) { setErr("Enter your Acquia Client ID."); setPhase("form"); return; }
+    setErr(null); setPhase("trying"); setStatusMsg("Opening Acquia login…");
+    try {
+      const { code, verifier, redirectUri: ru } = await launchPKCE(id);
+      setStatusMsg("Completing sign-in…");
+      const data   = await exchangePKCECode(id, code, verifier, ru);
+      const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
+      await new Promise(ok => chrome.storage.local.set({
+        acquia_client_id: id, acquia_token: data.access_token,
+        acquia_token_exp: expiry, acquia_refresh: data.refresh_token ?? null,
+      }, ok));
+      _token = data.access_token; _tokenExp = expiry;
+      onSave(id);
+    } catch (e) {
+      const isRedirectIssue = /could not be loaded|not approve|cancelled|closed/i.test(e.message);
+      if (isRedirectIssue) { setPhase("redirect_needed"); return; }
+      setErr(e.message); setPhase("form");
+    }
+  };
+
   /* ── Connect button handler — cascades: client_credentials → device_code → PKCE ── */
   const connect = async () => {
     const id  = clientId.trim();
@@ -681,13 +703,9 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
       _token = data.access_token; _tokenExp = expiry;
       onSave(id);
     } catch (e) {
-      let msg = e.message;
-      if (/could not be loaded|cancelled|closed/i.test(msg)) {
-        msg = "Acquia login popup was closed or blocked. If it showed an error about 'redirect URI', "
-            + "please contact your Acquia admin to register this URI for your API token: "
-            + chrome.identity.getRedirectURL();
-      }
-      setErr(msg); setPhase("form");
+      const isRedirectIssue = /could not be loaded|not approve|cancelled|closed/i.test(e.message);
+      if (isRedirectIssue) { setPhase("redirect_needed"); return; }
+      setErr(e.message); setPhase("form");
     }
   };
 
@@ -695,6 +713,60 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
     if (timerRef.current) clearTimeout(timerRef.current);
     setPhase("form"); setDeviceInfo(null); setErr(null); setPollCount(0);
   };
+
+  /* ── Redirect URI setup guide ── */
+  const redirectUri = chrome.identity.getRedirectURL();
+  if (phase === "redirect_needed") return (
+    <div className="page">
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="topbar-icon"><Ico.Network /></div>
+          <span className="topbar-title">Acquia DNS Finder</span>
+          <div className="topbar-right"><span className="topbar-tag">Setup</span></div>
+        </div>
+      </header>
+      <main className="main" style={{ maxWidth: 580 }}>
+        <div className="card">
+          <div className="card-head"><span className="card-head-label"><Ico.Key /> One-Time Setup Required</span></div>
+          <div className="card-body">
+            <p className="settings-intro">
+              The login popup opened but Acquia blocked the return URL. You need to register
+              this extension's callback URI in your Acquia API token — it's a one-time step.
+            </p>
+
+            <div className="auth-step-box">
+              <div className="auth-step-label">Step 1 — Copy this Callback URI</div>
+              <div className="auth-step-url" style={{ wordBreak:"break-all" }}>{redirectUri}</div>
+              <button className="btn-ghost" style={{ marginTop:10, fontSize:"0.78rem" }}
+                onClick={() => navigator.clipboard.writeText(redirectUri)}>
+                Copy to clipboard
+              </button>
+            </div>
+
+            <div className="auth-step-box" style={{ marginTop:14 }}>
+              <div className="auth-step-label">Step 2 — Add it to your Acquia API token</div>
+              <ol style={{ paddingLeft:18, lineHeight:1.9, fontSize:"0.84rem", color:"var(--t1)", marginTop:8 }}>
+                <li>Go to <strong>cloud.acquia.com</strong></li>
+                <li>Click your name (top-right) → <strong>Account settings</strong></li>
+                <li>Click <strong>API tokens</strong></li>
+                <li>Click your token name to edit it</li>
+                <li>Find the <strong>Callback URLs</strong> (or Redirect URIs) field</li>
+                <li>Paste the URI above and save</li>
+              </ol>
+            </div>
+
+            <button className="btn-primary" style={{ width:"100%", marginTop:18 }}
+              onClick={() => tryPKCE(clientId.trim())}>
+              I've added it — Try Again
+            </button>
+            <button className="btn-ghost" style={{ width:"100%", marginTop:10 }} onClick={goBack}>
+              ← Back
+            </button>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
 
   /* ── Device waiting UI ── */
   if (phase === "device_waiting" && deviceInfo) return (
