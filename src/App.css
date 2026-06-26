@@ -621,31 +621,6 @@ pre.code-block:last-child { margin-bottom: 0; }
 
 .card-body { padding: 18px 20px; }
 
-/* ── Device code ─────────────────────────────────────────────────────────── */
-
-.device-box {
-  background: var(--bg-surface); border: 1px solid var(--border);
-  border-radius: var(--r-sm); padding: 14px 16px;
-}
-
-.device-box-label {
-  font-size: 0.63rem; font-weight: 700; letter-spacing: 0.09em;
-  text-transform: uppercase; color: var(--t2); margin-bottom: 8px;
-}
-
-.device-url {
-  font-family: var(--mono); font-size: 0.88rem; color: var(--blue);
-}
-
-.device-code {
-  font-family: var(--mono); font-size: 2.2rem; font-weight: 700;
-  letter-spacing: 0.18em; color: var(--t0); margin-top: 6px;
-}
-
-.device-status {
-  display: flex; align-items: center; gap: 10px;
-  margin-top: 18px; font-size: 0.82rem; color: var(--t2);
-}
 
 /* ── Scrollbar ───────────────────────────────────────────────────────────── */
 
