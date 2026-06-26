@@ -13,6 +13,7 @@ const manifest = {
   host_permissions: [
     "https://cloud.acquia.com/*",
     "https://accounts.acquia.com/*",
+    "https://id.acquia.com/*",
     "https://cloudflare-dns.com/*"
   ]
 };

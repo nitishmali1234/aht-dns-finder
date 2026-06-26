@@ -1,5 +1,5 @@
 /* global chrome */
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import "./App.css";
 
 /* ─── API constants ──────────────────────────────────────────────────────── */
@@ -533,27 +533,144 @@ const EnvGrid = ({ environments }) => (
 
 /* ─── Settings / Connect page ────────────────────────────────────────────── */
 
+// phase: "form" | "trying" | "device_waiting" | "done"
 const SettingsPage = ({ onSave, clientId: existingId }) => {
   const [clientId,     setClientId]     = useState(existingId || "");
   const [clientSecret, setClientSecret] = useState("");
-  const [loading,      setLoading]      = useState(false);
+  const [phase,        setPhase]        = useState("form");
+  const [statusMsg,    setStatusMsg]    = useState("");
+  const [deviceInfo,   setDeviceInfo]   = useState(null);
+  const [polls,        setPollCount]    = useState(0);
   const [err,          setErr]          = useState(null);
+  const timerRef = useRef(null);
 
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+
+  /* ── Device poll loop ── */
+  const schedulePoll = (id, deviceCode, intervalSec, deadline) => {
+    timerRef.current = setTimeout(async () => {
+      if (Date.now() > deadline) {
+        setErr("Code expired — click back and try again."); setPhase("form"); return;
+      }
+      setPollCount(n => n + 1);
+      const resp = await bgMsg({ type: "ACQUIA_DEVICE_POLL", clientId: id, deviceCode });
+      if (!resp) { schedulePoll(id, deviceCode, intervalSec, deadline); return; }
+      let d = {};
+      try { d = JSON.parse(resp.body); } catch {}
+
+      if (d.access_token) {
+        const expiry = Date.now() + ((d.expires_in ?? 7200) - 120) * 1000;
+        await new Promise(ok => chrome.storage.local.set({
+          acquia_client_id: id, acquia_token: d.access_token,
+          acquia_token_exp: expiry, acquia_refresh: d.refresh_token ?? null,
+        }, ok));
+        _token = d.access_token; _tokenExp = expiry;
+        onSave(id); return;
+      }
+      if (d.error === "authorization_pending") { schedulePoll(id, deviceCode, intervalSec, deadline); return; }
+      if (d.error === "slow_down")             { schedulePoll(id, deviceCode, intervalSec + 5, deadline); return; }
+      if (d.error === "expired_token")         { setErr("Code expired — try again."); setPhase("form"); return; }
+      if (d.error === "access_denied")         { setErr("Authorization denied."); setPhase("form"); return; }
+      if (d.error) { setErr(d.error_description || d.error); setPhase("form"); return; }
+      schedulePoll(id, deviceCode, intervalSec, deadline);
+    }, intervalSec * 1000);
+  };
+
+  /* ── Device flow start ── */
+  const startDeviceFlow = async (id) => {
+    setStatusMsg("Starting device authorization…");
+    const resp = await bgMsg({ type: "ACQUIA_DEVICE_START", clientId: id });
+    let d = {};
+    try { d = JSON.parse(resp?.body || "{}"); } catch {}
+    if (!resp?.ok || !d.device_code) {
+      const msg = d.error_description || d.error || resp?.body || `Status ${resp?.status}`;
+      throw new Error(msg);
+    }
+    setDeviceInfo(d);
+    setPhase("device_waiting");
+    schedulePoll(id, d.device_code, d.interval || 5, Date.now() + (d.expires_in || 300) * 1000);
+  };
+
+  /* ── Connect button handler ── */
   const connect = async () => {
     const id  = clientId.trim();
     const sec = clientSecret.trim();
-    if (!id)  { setErr("Enter your Acquia Client ID."); return; }
-    if (!sec) { setErr("Enter your Acquia Client Secret."); return; }
-    setErr(null); setLoading(true);
+    if (!id) { setErr("Enter your Acquia Client ID."); return; }
+    setErr(null); setPhase("trying");
+
+    /* First try client_credentials (works if Okta allows it for this app) */
+    if (sec) {
+      setStatusMsg("Trying API credentials…");
+      try {
+        await authViaBackground(id, sec);
+        onSave(id); return;
+      } catch (e) {
+        const isPKCE = /pkce|proof key|authorization_code/i.test(e.message);
+        if (!isPKCE) { setErr(e.message); setPhase("form"); return; }
+        /* PKCE enforcement → fall through to device flow */
+      }
+    }
+
+    /* Device Code flow — no redirect URI needed */
     try {
-      await authViaBackground(id, sec);
-      onSave(id);
+      await startDeviceFlow(id);
     } catch (e) {
-      setErr(e.message);
-      setLoading(false);
+      setErr(e.message); setPhase("form");
     }
   };
 
+  const goBack = () => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setPhase("form"); setDeviceInfo(null); setErr(null); setPollCount(0);
+  };
+
+  /* ── Device waiting UI ── */
+  if (phase === "device_waiting" && deviceInfo) return (
+    <div className="page">
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="topbar-icon"><Ico.Network /></div>
+          <span className="topbar-title">Acquia DNS Finder</span>
+          <div className="topbar-right"><span className="topbar-tag">Authorizing</span></div>
+        </div>
+      </header>
+      <main className="main" style={{ maxWidth: 560 }}>
+        <div className="card">
+          <div className="card-head"><span className="card-head-label"><Ico.Key /> Authorize in Acquia</span></div>
+          <div className="card-body">
+            <p className="settings-intro">
+              Open the link below and enter the code when prompted. The extension will connect automatically once you approve.
+            </p>
+
+            <div className="auth-step-box">
+              <div className="auth-step-label">Step 1 — Open this URL in your browser</div>
+              <div className="auth-step-url">{deviceInfo.verification_uri}</div>
+              <button className="btn-ghost" style={{ marginTop:10, fontSize:"0.78rem" }}
+                onClick={() => chrome.tabs.create({ url: deviceInfo.verification_uri_complete || deviceInfo.verification_uri })}>
+                Open in new tab →
+              </button>
+            </div>
+
+            <div className="auth-step-box" style={{ marginTop:14, textAlign:"center" }}>
+              <div className="auth-step-label">Step 2 — Enter this code</div>
+              <div className="auth-step-code">{deviceInfo.user_code}</div>
+            </div>
+
+            <div className="auth-step-status">
+              <span className="spin-light" />
+              Waiting for approval… <span style={{ color:"var(--t3)" }}>({polls} check{polls !== 1 ? "s" : ""})</span>
+            </div>
+
+            {err && <div className="alert alert-error" style={{ marginTop:14 }}><Ico.AlertTri />{err}</div>}
+            <button className="btn-ghost" style={{ width:"100%", marginTop:14 }} onClick={goBack}>← Back</button>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+
+  /* ── Main form ── */
+  const busy = phase === "trying";
   return (
     <div className="page">
       <header className="topbar">
@@ -565,47 +682,34 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
       </header>
       <main className="main" style={{ maxWidth: 560 }}>
         <div className="card">
-          <div className="card-head">
-            <span className="card-head-label"><Ico.Key /> Connect Acquia Account</span>
-          </div>
+          <div className="card-head"><span className="card-head-label"><Ico.Key /> Connect Acquia Account</span></div>
           <div className="card-body">
             <p className="settings-intro">
-              Enter your Acquia API credentials. They are stored locally in Chrome and never leave your browser.
+              Enter your Acquia API credentials. The extension tries API key auth first; if that's blocked it switches to a browser-based device flow automatically.
             </p>
 
             <div className="settings-field">
               <label className="settings-field-label">Client ID</label>
-              <input
-                className="settings-input"
-                type="text"
+              <input className="settings-input" type="text"
                 placeholder="e62adfc6-c7ee-403b-ba40-172c90e792cf"
-                value={clientId}
+                value={clientId} autoFocus
                 onChange={e => { setClientId(e.target.value); setErr(null); }}
-                onKeyDown={e => e.key === "Enter" && !loading && connect()}
-                autoFocus
-              />
+                onKeyDown={e => e.key === "Enter" && !busy && connect()} />
             </div>
 
             <div className="settings-field">
-              <label className="settings-field-label">Client Secret</label>
-              <input
-                className="settings-input"
-                type="password"
-                placeholder="Your Acquia API secret"
+              <label className="settings-field-label">Client Secret <span style={{ color:"var(--t3)", fontWeight:400 }}>(optional — for faster auth)</span></label>
+              <input className="settings-input" type="password"
+                placeholder="Leave blank to use browser-based login"
                 value={clientSecret}
                 onChange={e => { setClientSecret(e.target.value); setErr(null); }}
-                onKeyDown={e => e.key === "Enter" && !loading && connect()}
-              />
+                onKeyDown={e => e.key === "Enter" && !busy && connect()} />
             </div>
 
-            {err && (
-              <div className="alert alert-error" style={{ marginBottom: 14 }}>
-                <Ico.AlertTri />{err}
-              </div>
-            )}
+            {err && <div className="alert alert-error" style={{ marginBottom:14 }}><Ico.AlertTri />{err}</div>}
 
-            <button className="btn-primary" style={{ width: "100%" }} onClick={connect} disabled={loading}>
-              {loading ? <><span className="spin" />Connecting…</> : <>Save &amp; Connect</>}
+            <button className="btn-primary" style={{ width:"100%" }} onClick={connect} disabled={busy}>
+              {busy ? <><span className="spin" />{statusMsg || "Connecting…"}</> : <>Connect with Acquia</>}
             </button>
 
             <div className="settings-how">
@@ -614,7 +718,7 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
                 <li>Go to <strong>cloud.acquia.com</strong></li>
                 <li>Click your name (top-right) → <strong>Account settings</strong></li>
                 <li>Click <strong>API tokens</strong> → <strong>Create token</strong></li>
-                <li>Copy the <strong>Key</strong> (Client ID) and <strong>Secret</strong> and paste above</li>
+                <li>Copy the <strong>Key</strong> (Client ID) and optionally the <strong>Secret</strong></li>
               </ol>
             </div>
           </div>
