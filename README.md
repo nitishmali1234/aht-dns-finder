@@ -1,70 +1,118 @@
-# Getting Started with Create React App
+# Acquia DNS Finder
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+A Chrome Extension for T1 Support Engineers to check DNS repointing status for Acquia hosted applications. No backend server required — everything runs locally on your Mac.
 
-## Available Scripts
+---
 
-In the project directory, you can run:
+## Prerequisites
 
-### `npm start`
+Make sure you have these before starting:
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+| Requirement | How to check |
+|---|---|
+| Google Chrome | Open Chrome — if it opens, you're good |
+| Python 3 | Open Terminal → type `python3 --version` |
+| `aht` CLI | Open Terminal → type `aht --version` |
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+> If `aht` is not found, install it from the internal Support-Tools repo first.
 
-### `npm test`
+---
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+## Installation
 
-### `npm run build`
+### Step 1 — Get the project
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+**Option A: Git clone**
+```
+git clone <repo-url>
+```
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+**Option B: Download ZIP**
+- Download the ZIP from the repo
+- Unzip it anywhere on your Mac (Desktop is fine)
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+---
 
-### `npm run eject`
+### Step 2 — Run the installer
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+1. Open the project folder in Finder
+2. **Double-click `install.command`**
+3. A Terminal window opens and runs automatically
+4. Wait for it to print **"Backend installed successfully"**
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+> If macOS blocks it with *"cannot be opened because it is from an unidentified developer"*:
+> Right-click `install.command` → click **Open** → click **Open** again
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+---
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
+### Step 3 — Load the extension in Chrome
 
-## Learn More
+1. Open Chrome and go to: **`chrome://extensions`**
+2. Toggle **Developer mode** ON (top-right corner)
+3. Click **Load unpacked**
+4. Navigate to the project folder and select the **`build`** folder inside it
+5. Click **Select**
 
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+You should now see **Acquia DNS Finder** listed in your extensions.
 
-To learn React, check out the [React documentation](https://reactjs.org/).
+---
 
-### Code Splitting
+### Step 4 — Pin it to your toolbar (recommended)
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
+1. Click the puzzle piece icon in the Chrome toolbar
+2. Find **Acquia DNS Finder**
+3. Click the pin icon next to it
 
-### Analyzing the Bundle Size
+---
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
+## How to Use
 
-### Making a Progressive Web App
+1. Click the **Acquia DNS Finder** icon in your Chrome toolbar — a new tab opens
+2. Type the **application name** in the search box (e.g. `iqstudent`)
+   - Application name only — no `@` prefix, no `.prod` suffix
+3. Click **Run Check**
+4. Results show:
+   - Overall repointing status (complete or incomplete)
+   - Environment details with EIPs and balancer info
+   - Per-domain DNS check with expected vs actual IPs
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
+---
 
-### Advanced Configuration
+## Updating
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
+When a new version is released:
 
-### Deployment
+1. Pull the latest changes (`git pull`) or download the new ZIP
+2. Double-click **`install.command`** again
+3. Go to `chrome://extensions` → find Acquia DNS Finder → click the **reload icon** (↺)
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
+No need to remove and re-add the extension.
 
-### `npm run build` fails to minify
+---
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+## Troubleshooting
+
+**"No environments found" error**
+- Use only the application name (e.g. `iqstudent`, not `iqstudent.prod`)
+- Confirm the application exists in CCI
+
+**"Native host error" or blank results**
+- Make sure you ran `install.command` first
+- Try removing the extension from Chrome and re-loading the `build` folder
+
+**`install.command` won't open**
+- Right-click it → Open → Open (bypasses macOS security warning)
+
+**`aht` not found during install**
+- Confirm `aht` works in Terminal first: `aht --version`
+- Make sure Support-Tools is installed before running the installer
+
+---
+
+## How it works
+
+When you click Run Check, the extension talks to a small local Python script (`native_host.py`) using Chrome's built-in Native Messaging. That script runs `aht` commands on your Mac and sends results back to the browser tab. Nothing is sent to any external server — everything runs locally.
+
+---
+
+*Internal tool — Acquia T1 Support*

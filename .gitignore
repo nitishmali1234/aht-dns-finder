@@ -9,7 +9,14 @@
 /coverage
 
 # production
-/build
+# /build is intentionally committed so teammates don't need Node.js
+
+# python
+venv/
+__pycache__/
+*.pyc
+src/nitish.py
+backend.py
 
 # misc
 .DS_Store
