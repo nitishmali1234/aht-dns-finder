@@ -27,10 +27,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'ACQUIA_DEVICE_START') {
-    post(DEVICE_URL, {
-      client_id: msg.clientId,
-      scope:     'openid',
-    }, sendResponse);
+    post(DEVICE_URL, { client_id: msg.clientId }, sendResponse);
     return true;
   }
 

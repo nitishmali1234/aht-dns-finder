@@ -605,9 +605,11 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
         await authViaBackground(id, sec);
         onSave(id); return;
       } catch (e) {
-        const isPKCE = /pkce|proof key|authorization_code/i.test(e.message);
-        if (!isPKCE) { setErr(e.message); setPhase("form"); return; }
-        /* PKCE enforcement → fall through to device flow */
+        // 401 with wrong credentials → show error and stop
+        // 403 or PKCE/unauthorized_client → this grant type isn't allowed for this app → try device flow
+        const isCredentialError = /401/.test(e.message) && !/pkce|proof key|unauthorized_client/i.test(e.message);
+        if (isCredentialError) { setErr(e.message); setPhase("form"); return; }
+        /* Grant type not allowed (403 / unauthorized_client / PKCE) → fall through to device flow */
       }
     }
 
