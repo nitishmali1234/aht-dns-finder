@@ -585,6 +585,42 @@ pre.code-block {
 
 pre.code-block:last-child { margin-bottom: 0; }
 
+/* ── Settings page ────────────────────────────────────────────────────────── */
+
+.settings-intro {
+  font-size: 0.84rem; color: var(--t2); line-height: 1.7; margin-bottom: 20px;
+}
+
+.settings-field { margin-bottom: 14px; }
+
+.settings-field-label {
+  display: block;
+  font-size: 0.63rem; font-weight: 700; letter-spacing: 0.09em;
+  text-transform: uppercase; color: var(--t2); margin-bottom: 7px;
+}
+
+.settings-input {
+  width: 100%; padding: 10px 13px;
+  font-family: var(--mono); font-size: 0.84rem;
+  background: var(--bg-input); color: var(--t0);
+  border: 1.5px solid var(--border); border-radius: var(--r-sm);
+  outline: none; transition: border-color 0.15s;
+}
+
+.settings-input:focus { border-color: var(--blue); }
+.settings-input::placeholder { color: var(--t3); }
+
+.settings-how {
+  margin-top: 18px; padding: 14px 16px;
+  background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: var(--r-sm); font-size: 0.78rem; color: var(--t2); line-height: 1.9;
+}
+
+.settings-how ol { padding-left: 18px; margin-top: 4px; }
+.settings-how li { margin-bottom: 2px; }
+
+.card-body { padding: 18px 20px; }
+
 /* ── Scrollbar ───────────────────────────────────────────────────────────── */
 
 ::-webkit-scrollbar { width: 5px; height: 5px; }

@@ -2,6 +2,195 @@
 import { useState, useEffect } from "react";
 import "./App.css";
 
+/* ─── API constants ──────────────────────────────────────────────────────── */
+
+const ACQUIA_API  = "https://cloud.acquia.com/api";
+const ACQUIA_AUTH = "https://accounts.acquia.com/api/auth/oauth/token";
+const CF_DNS      = "https://cloudflare-dns.com/dns-query";
+
+/* ─── Token cache (module-level, survives re-renders) ────────────────────── */
+
+let _token   = null;
+let _tokenExp = 0;
+
+async function getToken(key, secret) {
+  if (_token && Date.now() < _tokenExp) return _token;
+  const res = await fetch(ACQUIA_AUTH, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=client_credentials&client_id=${encodeURIComponent(key)}&client_secret=${encodeURIComponent(secret)}`,
+  });
+  if (!res.ok) throw new Error("Invalid API credentials — check your key and secret.");
+  const data = await res.json();
+  _token    = data.access_token;
+  _tokenExp = Date.now() + (data.expires_in - 60) * 1000;
+  return _token;
+}
+
+/* ─── Acquia Cloud API helpers ───────────────────────────────────────────── */
+
+async function acqGet(token, path) {
+  const res = await fetch(`${ACQUIA_API}${path}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`Acquia API ${res.status} on ${path}`);
+  return res.json();
+}
+
+async function findApp(token, name) {
+  // Try exact filter first
+  try {
+    const d = await acqGet(token, `/applications?filter=hosting_id%3D${encodeURIComponent(name)}&sort=name`);
+    const items = d._embedded?.items || [];
+    if (items.length) return items[0];
+  } catch {}
+
+  // Fall back to listing first 100 and matching by docroot suffix
+  const d = await acqGet(token, "/applications?sort=name&limit=100");
+  const all = d._embedded?.items || [];
+  const match = all.find(a => {
+    const docroot = (a.hosting?.id || "").split(":").pop();
+    return docroot === name || (a.name || "").toLowerCase() === name.toLowerCase();
+  });
+  if (match) return match;
+  throw new Error(`Application "${name}" not found. Verify the docroot name.`);
+}
+
+async function getEnvs(token, appUuid) {
+  const d = await acqGet(token, `/applications/${appUuid}/environments`);
+  return d._embedded?.items || [];
+}
+
+async function getEnvDomains(token, envUuid) {
+  try {
+    const d = await acqGet(token, `/environments/${envUuid}/domains`);
+    return (d._embedded?.items || [])
+      .map(i => i.hostname || i.name || i.domain)
+      .filter(Boolean);
+  } catch { return []; }
+}
+
+/* ─── DNS-over-HTTPS (Cloudflare 1.1.1.1) ───────────────────────────────── */
+
+async function resolveDomain(domain) {
+  const [aData, cData] = await Promise.all([
+    fetch(`${CF_DNS}?name=${encodeURIComponent(domain)}&type=A`,     { headers: { Accept: "application/dns-json" } }).then(r => r.json()).catch(() => null),
+    fetch(`${CF_DNS}?name=${encodeURIComponent(domain)}&type=CNAME`, { headers: { Accept: "application/dns-json" } }).then(r => r.json()).catch(() => null),
+  ]);
+  const ips    = (aData?.Answer || []).filter(a => a.type === 1).map(a => a.data);
+  const cnames = [
+    ...(aData?.Answer  || []).filter(a => a.type === 5),
+    ...(cData?.Answer  || []).filter(a => a.type === 5),
+  ].map(a => a.data.replace(/\.$/, "")).filter((v, i, arr) => arr.indexOf(v) === i);
+  return { ips, cnames };
+}
+
+function dnsStatus(ips, cnames, expectedIPs) {
+  if (!ips.length && !cnames.length) return "no_dns";
+  if (expectedIPs.length && ips.some(ip => expectedIPs.includes(ip))) return "ok_a";
+  const all = [...ips, ...cnames].join(" ").toLowerCase();
+  if (all.includes("cloudflare") || cnames.some(c => /\.cloudflare\.net$/.test(c))) return "cloudflare";
+  if (all.includes("akamai") || all.includes("edgekey") || all.includes("akamaiedge"))  return "akamai";
+  if (all.includes("fastly")) return "fastly";
+  if (cnames.some(c => c.includes("acquia-sites") || c.includes("acquia.com"))) return "ok_cname";
+  if (cnames.length) return "cname_other";
+  if (ips.length)    return "not_pointing";
+  return "no_dns";
+}
+
+/* ─── Main check ─────────────────────────────────────────────────────────── */
+
+const OK_STATUSES = new Set(["ok_a", "ok_cname", "cloudflare", "akamai", "fastly"]);
+
+async function performCheck(appName, creds, onStep) {
+  onStep(0);
+  const token = await getToken(creds.key, creds.secret);
+
+  onStep(1);
+  const app     = await findApp(token, appName);
+  const envList = await getEnvs(token, app.uuid);
+
+  onStep(2);
+  const envDomainsList = await Promise.all(
+    envList.map(env => getEnvDomains(token, env.uuid || env.id))
+  );
+
+  onStep(3);
+  // Flatten all domains for parallel DNS resolution
+  const tasks = [];
+  envList.forEach((env, i) => {
+    const expectedIPs = env.ips || [];
+    envDomainsList[i].forEach(domain => {
+      if (domain.endsWith(".acquia-sites.com") || domain.endsWith(".acquia.com")) return;
+      tasks.push({ env, domain, expectedIPs });
+    });
+  });
+
+  const dnsResults = await Promise.all(
+    tasks.map(async ({ env, domain, expectedIPs }) => {
+      const { ips, cnames } = await resolveDomain(domain);
+      const status = dnsStatus(ips, cnames, expectedIPs);
+      return {
+        env:         env.name,
+        domain,
+        expected_ip: expectedIPs[0] || null,
+        actual_ip:   ips[0] || null,
+        cname:       cnames[0] || null,
+        status,
+        matches:     OK_STATUSES.has(status),
+      };
+    })
+  );
+
+  // Group by environment
+  const environments = envList.map(env => {
+    const domains    = dnsResults.filter(d => d.env === env.name);
+    const repointed  = domains.length === 0 || domains.every(d => OK_STATUSES.has(d.status));
+    return {
+      name:       env.name,
+      label:      env.label || env.name,
+      ips:        env.ips || [],
+      primary_ip: (env.ips || [])[0] || null,
+      type:       env.type || (env.name === "prod" ? "production" : "non-production"),
+      repointed,
+      domains,
+    };
+  });
+
+  const allRepointed = environments.every(e => e.repointed);
+  const cdnDomains   = dnsResults.filter(d => ["cloudflare", "akamai", "fastly"].includes(d.status));
+
+  const issues   = environments
+    .filter(e => !e.repointed && e.domains.length > 0)
+    .map(e => `${e.label} domains have NOT been repointed`);
+  const warnings = [];
+  if (cdnDomains.length)
+    warnings.push(`${cdnDomains.length} domain(s) use a CDN — verify origin is pointing to the correct Acquia IP`);
+  const uniqueIPs = new Set(environments.map(e => e.primary_ip).filter(Boolean));
+  if (uniqueIPs.size > 1)
+    warnings.push("Different IPs across environments — share the correct IP per environment with the customer");
+
+  return {
+    customer:     appName,
+    app_name:     app.name,
+    environments,
+    all_repointed: allRepointed,
+    total_domains: dnsResults.length,
+    issues,
+    warnings,
+    cdn_detected:  cdnDomains.length > 0,
+  };
+}
+
+/* ─── Scan steps ─────────────────────────────────────────────────────────── */
+
+const SCAN_STEPS = [
+  { label: "Authenticating with Acquia",  cmd: "POST accounts.acquia.com/api/auth/oauth/token"   },
+  { label: "Fetching application info",   cmd: "GET  cloud.acquia.com/api/applications/…/environments" },
+  { label: "Loading domain lists",        cmd: "GET  cloud.acquia.com/api/environments/…/domains" },
+  { label: "Resolving DNS records",       cmd: "Cloudflare DNS-over-HTTPS (1.1.1.1)"              },
+];
+
 /* ─── Icons ──────────────────────────────────────────────────────────────── */
 
 const Ico = {
@@ -46,10 +235,16 @@ const Ico = {
       <circle cx="7.5" cy="11" r="0.75" fill="currentColor"/>
     </svg>
   ),
-  Copy: () => (
-    <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
-      <rect x="4" y="4" width="8" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.3"/>
-      <path d="M2 9.5V2.5C2 2.22 2.22 2 2.5 2H9.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+  Key: () => (
+    <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+      <circle cx="5.5" cy="7.5" r="3.5" stroke="currentColor" strokeWidth="1.3"/>
+      <path d="M8.5 7.5H14M12 5.5V7.5M14 5.5V7.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+    </svg>
+  ),
+  Settings: () => (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+      <circle cx="7" cy="7" r="2.5" stroke="currentColor" strokeWidth="1.3"/>
+      <path d="M7 1v1.5M7 11.5V13M1 7h1.5M11.5 7H13M2.6 2.6l1.1 1.1M10.3 10.3l1.1 1.1M2.6 11.4l1.1-1.1M10.3 3.7l1.1-1.1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
     </svg>
   ),
   Chevron: () => (
@@ -82,14 +277,7 @@ const Ico = {
   ),
 };
 
-/* ─── Scan steps ─────────────────────────────────────────────────────────── */
-
-const SCAN_STEPS = [
-  { label: "Fetching application info",  cmd: "aht @{app} application:info" },
-  { label: "Resolving balancer EIPs",    cmd: "aht server bal-…"             },
-  { label: "Running domain check",       cmd: "aht @{app} domains:check"     },
-  { label: "Listing domain aliases",     cmd: "aht @{app} domains:list"      },
-];
+/* ─── ScanCard ───────────────────────────────────────────────────────────── */
 
 const ScanCard = ({ step, customer }) => (
   <div className="card">
@@ -110,7 +298,7 @@ const ScanCard = ({ step, customer }) => (
               </div>
               <div>
                 <div className="step-label">{s.label}</div>
-                <code className="step-cmd">{s.cmd.replace("{app}", customer)}</code>
+                <code className="step-cmd">{s.cmd}</code>
               </div>
               <div className="step-state">
                 {i < step ? "done" : i === step ? "running" : "queued"}
@@ -123,22 +311,21 @@ const ScanCard = ({ step, customer }) => (
   </div>
 );
 
-/* ─── Status pill ────────────────────────────────────────────────────────── */
+/* ─── StatusPill ─────────────────────────────────────────────────────────── */
 
 const StatusPill = ({ status }) => {
   const MAP = {
-    ok_a:          { label: "OK · A record",       cls: "sp-ok"      },
-    ok_cname:      { label: "OK · CNAME",           cls: "sp-ok"      },
-    cloudflare:    { label: "Cloudflare CDN",        cls: "sp-warn"    },
-    cloudflare_ns: { label: "CF Authoritative",      cls: "sp-warn"    },
-    akamai:        { label: "Akamai CDN",            cls: "sp-warn"    },
-    not_pointing:  { label: "Not pointing",          cls: "sp-error"   },
-    missing_edge:  { label: "Missing edge cluster",  cls: "sp-error"   },
-    bypassing:     { label: "Bypassing edge",        cls: "sp-warn"    },
-    no_dns:        { label: "No DNS entry",          cls: "sp-neutral" },
+    ok_a:        { label: "OK · A record",   cls: "sp-ok"      },
+    ok_cname:    { label: "OK · CNAME",      cls: "sp-ok"      },
+    cloudflare:  { label: "Cloudflare CDN",  cls: "sp-warn"    },
+    akamai:      { label: "Akamai CDN",      cls: "sp-warn"    },
+    fastly:      { label: "Fastly CDN",      cls: "sp-warn"    },
+    not_pointing:{ label: "Not pointing",    cls: "sp-error"   },
+    cname_other: { label: "CNAME (other)",   cls: "sp-neutral" },
+    no_dns:      { label: "No DNS entry",    cls: "sp-neutral" },
   };
   const c = MAP[status] ?? { label: status, cls: "sp-neutral" };
-  const dotCls = { "sp-ok": "d-ok", "sp-error": "d-error", "sp-warn": "d-warn", "sp-neutral": "d-neutral" }[c.cls];
+  const dotCls = { "sp-ok":"d-ok","sp-error":"d-error","sp-warn":"d-warn","sp-neutral":"d-neutral" }[c.cls];
   return (
     <span className={`spill ${c.cls}`}>
       <span className={`dot ${dotCls}`} />{c.label}
@@ -146,33 +333,33 @@ const StatusPill = ({ status }) => {
   );
 };
 
-/* ─── Env badge ──────────────────────────────────────────────────────────── */
+/* ─── EnvBadge ───────────────────────────────────────────────────────────── */
 
 const EnvBadge = ({ env }) => {
-  const cls = { prod: "eb-prod", dev: "eb-dev", test: "eb-test", stage: "eb-stage" }[env] ?? "eb-other";
+  const cls = { prod:"eb-prod", dev:"eb-dev", test:"eb-test", stage:"eb-stage", dev2:"eb-dev" }[env] ?? "eb-other";
   return <span className={`ebadge ${cls}`}>{env}</span>;
 };
 
-/* ─── Domain table ───────────────────────────────────────────────────────── */
+/* ─── DomainTable ────────────────────────────────────────────────────────── */
 
 const DomainTable = ({ domains }) => (
   <div className="table-wrap">
     <table className="domain-table">
       <thead>
         <tr>
-          <th>Domain</th><th>Env</th><th>Status</th>
-          <th>Expected IP</th><th>Actual IP</th><th>Match</th>
+          <th>Domain</th><th>Status</th>
+          <th>Expected IP</th><th>Actual IP</th><th>CNAME</th><th>Match</th>
         </tr>
       </thead>
       <tbody>
         {domains.map((d, i) => (
           <tr key={i}>
             <td className="td-domain">{d.domain}</td>
-            <td><EnvBadge env={d.env} /></td>
             <td><StatusPill status={d.status} /></td>
             <td className="td-ip">{d.expected_ip || "—"}</td>
-            <td className={`td-ip ${d.matches ? "td-ip-ok" : "td-ip-fail"}`}>
-              {d.actual_ip || "—"}
+            <td className={`td-ip ${d.matches ? "td-ip-ok" : "td-ip-fail"}`}>{d.actual_ip || "—"}</td>
+            <td className="td-ip" style={{ fontSize:"0.68rem", maxWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+              {d.cname || "—"}
             </td>
             <td>
               {d.matches
@@ -186,14 +373,10 @@ const DomainTable = ({ domains }) => (
   </div>
 );
 
-/* ─── Status card ────────────────────────────────────────────────────────── */
+/* ─── StatusCard ─────────────────────────────────────────────────────────── */
 
 const StatusCard = ({ result }) => {
-  const { summary, customer } = result;
-  const ok = summary.all_repointed;
-  const envRepointed = summary.env_repointed || {};
-  const domainsByEnv = summary.domains_by_env || {};
-
+  const ok = result.all_repointed;
   return (
     <div className="card">
       <div className="status-banner">
@@ -206,34 +389,30 @@ const StatusCard = ({ result }) => {
               {ok ? "DNS Repointing Complete" : "DNS Repointing Incomplete"}
             </div>
             <div className="status-meta">
-              Customer: <code>{customer}</code>
+              Customer: <code>{result.customer}</code>
+              {result.app_name && result.app_name !== result.customer && <> · {result.app_name}</>}
               &ensp;·&ensp;
-              {summary.total_domains} domain(s) across {Object.keys(envRepointed).length} environment(s)
-              {summary.cdn_detected && <>&ensp;·&ensp;CDN detected</>}
+              {result.total_domains} domain(s) across {result.environments.length} environment(s)
+              {result.cdn_detected && <>&ensp;·&ensp;CDN detected</>}
             </div>
           </div>
         </div>
         <div className="status-chips">
-          {Object.entries(envRepointed).map(([env, envOk]) => (
-            <div key={env} className={`status-chip ${envOk ? "chip-ok" : "chip-error"}`}>
-              <span className={`dot ${envOk ? "d-ok" : "d-error"}`} />
-              {env} · <strong>{domainsByEnv[env] ?? 0}</strong>
+          {result.environments.map(env => (
+            <div key={env.name} className={`status-chip ${env.repointed ? "chip-ok" : "chip-error"}`}>
+              <span className={`dot ${env.repointed ? "d-ok" : "d-error"}`} />
+              {env.name} · <strong>{env.domains.length}</strong>
             </div>
           ))}
         </div>
       </div>
-
-      {(summary.issues.length > 0 || summary.warnings.length > 0) && (
+      {(result.issues.length > 0 || result.warnings.length > 0) && (
         <div className="issues-list">
-          {summary.issues.map((m, i) => (
-            <div key={i} className="alert alert-error">
-              <Ico.XCircle />{m.replace(/^[❌⚠️]\s*/, "")}
-            </div>
+          {result.issues.map((m, i) => (
+            <div key={i} className="alert alert-error"><Ico.AlertTri />{m}</div>
           ))}
-          {summary.warnings.map((m, i) => (
-            <div key={i} className="alert alert-warning">
-              <Ico.AlertTri />{m.replace(/^[❌⚠️]\s*/, "")}
-            </div>
+          {result.warnings.map((m, i) => (
+            <div key={i} className="alert alert-warning"><Ico.AlertTri />{m}</div>
           ))}
         </div>
       )}
@@ -241,27 +420,26 @@ const StatusCard = ({ result }) => {
   );
 };
 
-/* ─── Env grid ───────────────────────────────────────────────────────────── */
+/* ─── EnvGrid ────────────────────────────────────────────────────────────── */
 
-const EnvGrid = ({ environments, summary }) => (
+const EnvGrid = ({ environments }) => (
   <div className="card">
     <div className="card-head">
       <span className="card-head-label"><Ico.Server /> Environments</span>
     </div>
     <div className="env-grid">
-      {Object.entries(environments).map(([name, data]) => {
-        const ok = (summary.env_repointed || {})[name] ?? true;
-        const typeTag = { dedicated: "tag-dedicated", shared: "tag-shared" }[data.type] ?? "tag-unknown";
+      {environments.map(env => {
+        const typeTag = env.type === "production" ? "tag-dedicated" : "tag-shared";
         return (
-          <div key={name} className={`env-card ${ok ? "env-card-ok" : "env-card-error"}`}>
-            <div className="env-card-name">{name}</div>
+          <div key={env.name} className={`env-card ${env.repointed ? "env-card-ok" : "env-card-error"}`}>
+            <div className="env-card-name">{env.name}</div>
             <div className="env-card-status">
-              <span className={`dot ${ok ? "d-ok" : "d-error"}`} />
-              {ok ? "Repointed" : "Not repointed"}
+              <span className={`dot ${env.repointed ? "d-ok" : "d-error"}`} />
+              {env.repointed ? "Repointed" : "Not repointed"}
             </div>
-            <div className="env-card-eip">{data.eip || "—"}</div>
-            <div className="env-card-bal">{data.primary_balancer || "—"}</div>
-            <span className={`type-tag ${typeTag}`}>{data.type || "unknown"}</span>
+            <div className="env-card-eip">{env.primary_ip || "—"}</div>
+            <div className="env-card-bal">{env.label}</div>
+            <span className={`type-tag ${typeTag}`}>{env.type || "unknown"}</span>
           </div>
         );
       })}
@@ -269,85 +447,164 @@ const EnvGrid = ({ environments, summary }) => (
   </div>
 );
 
-/* ─── Slack card ─────────────────────────────────────────────────────────── */
+/* ─── Settings page ──────────────────────────────────────────────────────── */
 
+const SettingsPage = ({ onSave, existing }) => {
+  const [key,     setKey]     = useState(existing?.key    || "");
+  const [secret,  setSecret]  = useState(existing?.secret || "");
+  const [testing, setTesting] = useState(false);
+  const [err,     setErr]     = useState(null);
+  const [ok,      setOk]      = useState(false);
 
-/* ─── Collapsible ────────────────────────────────────────────────────────── */
+  const save = async () => {
+    if (!key.trim() || !secret.trim()) { setErr("Both fields are required."); return; }
+    setTesting(true); setErr(null); setOk(false);
+    try {
+      _token = null; // clear cache
+      await getToken(key.trim(), secret.trim());
+      chrome.storage.local.set({ acquia_key: key.trim(), acquia_secret: secret.trim() });
+      setOk(true);
+      setTimeout(() => onSave({ key: key.trim(), secret: secret.trim() }), 800);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setTesting(false);
+    }
+  };
 
-const Coll = ({ icon, label, children }) => {
-  const [open, setOpen] = useState(false);
   return (
-    <>
-      <button className="coll-trigger" onClick={() => setOpen(o => !o)}>
-        {icon}{label}
-        <span className={`coll-chevron ${open ? "open" : ""}`}><Ico.Chevron /></span>
-      </button>
-      {open && <div className="coll-body">{children}</div>}
-    </>
+    <div className="page">
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="topbar-icon"><Ico.Network /></div>
+          <span className="topbar-title">Acquia DNS Finder</span>
+          <div className="topbar-right">
+            <span className="topbar-tag">Setup</span>
+          </div>
+        </div>
+      </header>
+      <main className="main" style={{ maxWidth: 560 }}>
+        <div className="card">
+          <div className="card-head">
+            <span className="card-head-label"><Ico.Key /> Acquia Cloud API Credentials</span>
+          </div>
+          <div className="card-body">
+            <p className="settings-intro">
+              Connect to your Acquia Cloud account. Credentials are stored locally in Chrome and never leave your browser.
+            </p>
+
+            <div className="settings-field">
+              <label className="settings-field-label">API Key</label>
+              <input
+                className="settings-input"
+                type="text"
+                placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                value={key}
+                onChange={e => setKey(e.target.value)}
+                autoFocus
+              />
+            </div>
+
+            <div className="settings-field">
+              <label className="settings-field-label">API Secret</label>
+              <input
+                className="settings-input"
+                type="password"
+                placeholder="••••••••••••••••••••••••••••••••"
+                value={secret}
+                onChange={e => setSecret(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && save()}
+              />
+            </div>
+
+            {err && (
+              <div className="alert alert-error" style={{ marginBottom: 14 }}>
+                <Ico.AlertTri />{err}
+              </div>
+            )}
+            {ok && (
+              <div className="alert" style={{ background:"var(--green-dim)", borderColor:"var(--green-border)", color:"var(--green)", marginBottom:14 }}>
+                <Ico.Check /> Connected successfully!
+              </div>
+            )}
+
+            <button className="btn-primary" style={{ width:"100%" }} onClick={save} disabled={testing}>
+              {testing ? <><span className="spin" />Verifying…</> : <><Ico.Check /> Save &amp; Connect</>}
+            </button>
+
+            <div className="settings-how">
+              <strong style={{ color:"var(--t1)", display:"block", marginBottom:8 }}>How to get your API credentials</strong>
+              <ol>
+                <li>Go to <strong>cloud.acquia.com</strong></li>
+                <li>Click your name (top-right) → <strong>Account settings</strong></li>
+                <li>Click <strong>API tokens</strong> → <strong>Create token</strong></li>
+                <li>Copy the <strong>Key</strong> and <strong>Secret</strong> and paste above</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
   );
 };
 
 /* ─── App ────────────────────────────────────────────────────────────────── */
 
 export default function App() {
-  const [customer, setCustomer]           = useState("");
-  const [loading,  setLoading]            = useState(false);
-  const [scanStep, setScanStep]           = useState(0);
-  const [result,   setResult]             = useState(null);
-  const [error,    setError]              = useState(null);
-  const [rawDebug, setRawDebug]           = useState(null);
-  const [domainListLoading, setDomainListLoading] = useState(false);
-  const [domainListResult,  setDomainListResult]  = useState(null);
-  const [domainListError,   setDomainListError]   = useState(null);
+  const [creds,    setCreds]    = useState(undefined); // undefined=loading, null=no creds, obj=ready
+  const [customer, setCustomer] = useState("");
+  const [loading,  setLoading]  = useState(false);
+  const [scanStep, setScanStep] = useState(0);
+  const [result,   setResult]   = useState(null);
+  const [error,    setError]    = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
 
+  // Load credentials from Chrome storage on mount
+  useEffect(() => {
+    chrome.storage.local.get(["acquia_key", "acquia_secret"], ({ acquia_key, acquia_secret }) => {
+      setCreds(acquia_key && acquia_secret ? { key: acquia_key, secret: acquia_secret } : null);
+    });
+  }, []);
+
+  // Scan step animation
   useEffect(() => {
     if (!loading) { setScanStep(0); return; }
     const t = [
-      setTimeout(() => setScanStep(1), 2000),
-      setTimeout(() => setScanStep(2), 4500),
-      setTimeout(() => setScanStep(3), 6500),
+      setTimeout(() => setScanStep(1), 1500),
+      setTimeout(() => setScanStep(2), 4000),
+      setTimeout(() => setScanStep(3), 7000),
     ];
     return () => t.forEach(clearTimeout);
   }, [loading]);
 
-  const sendNative = (command, params) =>
-    new Promise((resolve, reject) => {
-      chrome.runtime.sendNativeMessage(
-        "com.acquia.dns_finder",
-        { command, ...params },
-        (response) => {
-          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-          else resolve(response);
-        }
-      );
-    });
-
-  const runFullCheck = async () => {
+  const runCheck = async () => {
     const name = customer.trim();
-    if (!name) { setError("Enter an application name first."); return; }
-    setLoading(true); setError(null); setResult(null); setRawDebug(null);
+    if (!name) { setError("Enter an application name."); return; }
+    setLoading(true); setError(null); setResult(null);
     try {
-      const data = await sendNative("full_check", { username: name });
-      if (data.success) { setResult(data); }
-      else { setError(data.error || "Check failed."); if (data.raw_outputs) setRawDebug(data.raw_outputs.app_info); }
+      const data = await performCheck(name, creds, setScanStep);
+      setResult(data);
     } catch (e) {
-      setError(`Native host error: ${e.message}. Run install.sh first.`);
-    } finally { setLoading(false); }
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const runDomainList = async () => {
-    const name = customer.trim();
-    if (!name) { setDomainListError("Enter an application name first."); return; }
-    setDomainListLoading(true); setDomainListError(null); setDomainListResult(null);
-    try {
-      const data = await sendNative("domain_list", { username: name });
-      if (data.success) setDomainListResult(data);
-      else setDomainListError(data.error || "Failed to fetch domain list.");
-    } catch (e) {
-      setDomainListError(`Native host error: ${e.message}.`);
-    } finally { setDomainListLoading(false); }
-  };
+  // Still loading credentials from storage
+  if (creds === undefined) return (
+    <div className="page" style={{ alignItems:"center", justifyContent:"center", display:"flex", height:"100vh" }}>
+      <span className="spin-light" style={{ width:24, height:24, borderWidth:3 }} />
+    </div>
+  );
 
+  // No credentials yet, or settings requested
+  if (creds === null || showSettings) return (
+    <SettingsPage
+      existing={creds || undefined}
+      onSave={c => { setCreds(c); setShowSettings(false); }}
+    />
+  );
 
   return (
     <div className="page">
@@ -358,6 +615,9 @@ export default function App() {
           <div className="topbar-icon"><Ico.Network /></div>
           <span className="topbar-title">Acquia DNS Finder</span>
           <div className="topbar-right">
+            <button className="btn-ghost" onClick={() => setShowSettings(true)}>
+              <Ico.Settings />API Settings
+            </button>
             <div className="live-badge"><span className="live-dot" />Live</div>
             <span className="topbar-tag">Internal</span>
           </div>
@@ -366,7 +626,7 @@ export default function App() {
 
       <main className="main">
 
-        {/* ── Search card ─────────────────────────────────────────────── */}
+        {/* ── Search ──────────────────────────────────────────────────── */}
         <div className="card">
           <div className="search-section">
             <div className="search-label">Application / Docroot Name</div>
@@ -377,137 +637,73 @@ export default function App() {
                   className="search-input"
                   type="text"
                   value={customer}
-                  onChange={e => { setCustomer(e.target.value); setError(null); setResult(null); setRawDebug(null); }}
-                  onKeyDown={e => e.key === "Enter" && !loading && runFullCheck()}
+                  onChange={e => { setCustomer(e.target.value); setError(null); setResult(null); }}
+                  onKeyDown={e => e.key === "Enter" && !loading && runCheck()}
                   placeholder="iqstudent"
                   disabled={loading}
                   autoFocus
                 />
               </div>
-              <div className="btn-row">
-                <button className="btn-primary" onClick={runFullCheck} disabled={loading}>
-                  {loading ? <><span className="spin" />Running…</> : <><Ico.Search />Run Check</>}
-                </button>
-                <button className="btn-secondary" onClick={runDomainList} disabled={domainListLoading}>
-                  {domainListLoading ? <><span className="spin-light" />Loading…</> : <><Ico.List />List Domains</>}
-                </button>
-              </div>
+              <button className="btn-primary" onClick={runCheck} disabled={loading}>
+                {loading ? <><span className="spin" />Running…</> : <><Ico.Search />Run Check</>}
+              </button>
             </div>
             <p className="search-hint">
-              Application name only — no "@" or environment suffix.
-              E.g. <code>iqstudent</code> not <code>iqstudent.prod</code>.
+              Application name only — no "@" prefix, no ".prod" suffix. E.g. <code>iqstudent</code>
             </p>
 
-            {/* Errors */}
             {!loading && error && (
-              <div style={{ marginTop: 14 }}>
-                <div className="alert alert-error"><Ico.AlertTri />{error}</div>
-                {rawDebug && (
-                  <details>
-                    <summary style={{ cursor:"pointer", fontSize:"0.74rem", color:"var(--t2)", padding:"4px 0" }}>
-                      Show raw aht output
-                    </summary>
-                    <pre className="raw-debug">{rawDebug}</pre>
-                  </details>
-                )}
-              </div>
-            )}
-            {domainListError && (
               <div className="alert alert-error" style={{ marginTop: 14 }}>
-                <Ico.AlertTri />{domainListError}
+                <Ico.AlertTri />{error}
               </div>
             )}
           </div>
         </div>
 
-        {/* ── Scanning ────────────────────────────────────────────────── */}
+        {/* ── Scan animation ──────────────────────────────────────────── */}
         {loading && <ScanCard step={scanStep} customer={customer.trim()} />}
-
-        {/* ── Domain list results ──────────────────────────────────────── */}
-        {domainListResult && (
-          <div className="card">
-            <div className="card-head">
-              <span className="card-head-label">
-                <Ico.List />Domain Aliases (do:li)
-                <span className="count-badge">{domainListResult.total_domains}</span>
-              </span>
-              <span className="card-head-meta">aht @{domainListResult.customer} domains:list</span>
-            </div>
-            <div className="card-body">
-              <div className="domain-list-grid">
-                {domainListResult.domains.map((d, i) => (
-                  <div key={i} className="domain-list-item">{d.domain}</div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
 
         {/* ── Results ─────────────────────────────────────────────────── */}
         {!loading && result && (
           <>
             <StatusCard result={result} />
 
-            <EnvGrid environments={result.environments} summary={result.summary} />
+            <EnvGrid environments={result.environments} />
 
             {/* Domain check — one section per environment */}
             <div className="card">
               <div className="card-head">
                 <span className="card-head-label">
                   <Ico.List />Domain Check
-                  <span className="count-badge">{result.summary.total_domains}</span>
+                  <span className="count-badge">{result.total_domains}</span>
                 </span>
-                <span className="card-head-meta">aht @{result.customer} domains:check</span>
+                <span className="card-head-meta">Cloudflare DNS-over-HTTPS</span>
               </div>
 
-              {Object.keys(result.environments).length === 0 && (
-                <div className="card-body" style={{ color:"var(--t2)", fontSize:"0.82rem" }}>
-                  No domains found.
-                </div>
-              )}
-
-              {Object.keys(result.environments).map(envName => {
-                const envDomains = result.domains.filter(d => d.env === envName);
-                if (envDomains.length === 0) return null;
-                const envOk = (result.summary.env_repointed || {})[envName] ?? true;
+              {result.environments.map(env => {
+                if (env.domains.length === 0) return null;
                 return (
-                  <div key={envName}>
+                  <div key={env.name}>
                     <div className="domain-section-label">
-                      <span className={`dot ${envOk ? "d-ok" : "d-error"}`} />
-                      <EnvBadge env={envName} />
-                      <span style={{ color: "var(--t2)" }}>{envDomains.length} domain(s)</span>
+                      <span className={`dot ${env.repointed ? "d-ok" : "d-error"}`} />
+                      <EnvBadge env={env.name} />
+                      <span style={{ color:"var(--t2)" }}>{env.domains.length} domain(s)</span>
+                      {env.primary_ip && (
+                        <code style={{ fontFamily:"var(--mono)", fontSize:"0.68rem", color:"var(--t3)" }}>
+                          → {env.primary_ip}
+                        </code>
+                      )}
                     </div>
-                    <DomainTable domains={envDomains} />
+                    <DomainTable domains={env.domains} />
                   </div>
                 );
               })}
 
-              {result.domain_list?.length > 0 && (
-                <Coll icon={<Ico.List />} label={`Domain aliases · ${result.domain_list.length} found`}>
-                  <div className="domain-list-grid">
-                    {result.domain_list.map((d, i) => (
-                      <div key={i} className="domain-list-item">{d.domain}</div>
-                    ))}
-                  </div>
-                </Coll>
+              {result.environments.every(e => e.domains.length === 0) && (
+                <div className="card-body" style={{ color:"var(--t2)", fontSize:"0.82rem" }}>
+                  No customer domains found for this application.
+                </div>
               )}
-            </div>
-
-
-            {/* Raw output */}
-            <div className="card">
-              <Coll icon={<Ico.Terminal />} label="Raw Command Output">
-                <div className="code-label">Command: <code>aht @{result.customer} application:info</code></div>
-                <pre className="code-block">{result.raw_outputs.app_info}</pre>
-                <div className="code-label">Command: <code>aht @{result.customer} domains:check</code></div>
-                <pre className="code-block">{result.raw_outputs.dc}</pre>
-                {result.raw_outputs.domain_list && (
-                  <>
-                    <div className="code-label">Command: <code>aht @{result.customer} domains:list</code></div>
-                    <pre className="code-block">{result.raw_outputs.domain_list}</pre>
-                  </>
-                )}
-              </Coll>
             </div>
           </>
         )}
