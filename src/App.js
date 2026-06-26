@@ -191,11 +191,8 @@ const DomainTable = ({ domains }) => (
 const StatusCard = ({ result }) => {
   const { summary, customer } = result;
   const ok = summary.all_repointed;
-  const needAction = result.domains.filter(d => !d.matches).length;
-  const envRows = [
-    { key: "prod",    label: "Production",    ok: summary.prod_repointed,     n: summary.prod_domains_count     },
-    { key: "nonprod", label: "Non-production", ok: summary.non_prod_repointed, n: summary.non_prod_domains_count },
-  ].filter(e => e.n > 0);
+  const envRepointed = summary.env_repointed || {};
+  const domainsByEnv = summary.domains_by_env || {};
 
   return (
     <div className="card">
@@ -211,18 +208,16 @@ const StatusCard = ({ result }) => {
             <div className="status-meta">
               Customer: <code>{customer}</code>
               &ensp;·&ensp;
-              {ok
-                ? `All ${summary.total_domains} domain(s) verified`
-                : `${needAction} of ${summary.total_domains} domain(s) require action`}
+              {summary.total_domains} domain(s) across {Object.keys(envRepointed).length} environment(s)
               {summary.cdn_detected && <>&ensp;·&ensp;CDN detected</>}
             </div>
           </div>
         </div>
         <div className="status-chips">
-          {envRows.map(e => (
-            <div key={e.key} className={`status-chip ${e.ok ? "chip-ok" : "chip-error"}`}>
-              <span className={`dot ${e.ok ? "d-ok" : "d-error"}`} />
-              {e.label} · <strong>{e.n}</strong>
+          {Object.entries(envRepointed).map(([env, envOk]) => (
+            <div key={env} className={`status-chip ${envOk ? "chip-ok" : "chip-error"}`}>
+              <span className={`dot ${envOk ? "d-ok" : "d-error"}`} />
+              {env} · <strong>{domainsByEnv[env] ?? 0}</strong>
             </div>
           ))}
         </div>
@@ -255,7 +250,7 @@ const EnvGrid = ({ environments, summary }) => (
     </div>
     <div className="env-grid">
       {Object.entries(environments).map(([name, data]) => {
-        const ok = name === "prod" ? summary.prod_repointed : summary.non_prod_repointed;
+        const ok = (summary.env_repointed || {})[name] ?? true;
         const typeTag = { dedicated: "tag-dedicated", shared: "tag-shared" }[data.type] ?? "tag-unknown";
         return (
           <div key={name} className={`env-card ${ok ? "env-card-ok" : "env-card-error"}`}>
@@ -276,57 +271,6 @@ const EnvGrid = ({ environments, summary }) => (
 
 /* ─── Slack card ─────────────────────────────────────────────────────────── */
 
-const SlackCard = ({ result }) => {
-  const [copied, setCopied] = useState(false);
-  const { summary, eips, customer } = result;
-
-  const text = (() => {
-    let r = summary.all_repointed
-      ? `✅ *DNS Repointing Status: COMPLETE*\n\nCustomer *${customer}* has repointed DNS to the new dedicated balancers.\n\n`
-      : `❌ *DNS Repointing Status: INCOMPLETE*\n\nCustomer *${customer}* has NOT repointed DNS yet.\n\n`;
-    r += "*EIP Information:*\n";
-    const pe = eips.prod, npe = eips.dev || eips.test || eips.stage;
-    if (pe)  r += `• Production EIP: \`${pe}\`\n`;
-    if (npe && npe !== pe) {
-      r += `• Non-Production EIP: \`${npe}\`\n`;
-      r += "\n⚠️ *Note:* Different EIPs for prod and non-prod — share both with the customer.\n";
-    } else if (npe) {
-      r += `• Non-Production EIP: \`${npe}\`\n`;
-    }
-    r += "\n";
-    if (summary.issues.length)   { r += "*Issues:*\n";   summary.issues.forEach(m => { r += `${m}\n`; }); r += "\n"; }
-    if (summary.warnings.length) { r += "*Warnings:*\n"; summary.warnings.forEach(m => { r += `${m}\n`; }); r += "\n"; }
-    r += "*Domain Summary:*\n";
-    r += `• Total: ${summary.total_domains} domain(s)\n`;
-    r += `• Production: ${summary.prod_domains_count} — ${summary.prod_repointed ? "✅ OK" : "❌ Needs repointing"}\n`;
-    r += `• Non-Production: ${summary.non_prod_domains_count} — ${summary.non_prod_repointed ? "✅ OK" : "❌ Needs repointing"}\n`;
-    if (!summary.all_repointed)
-      r += "\n*Next Steps:* Customer must update DNS before old shared balancers can be decommissioned.\n";
-    if (summary.cdn_detected)
-      r += "\n⚠️ *CDN Detected:* Some domains use Cloudflare/Akamai — customer may need to update CDN origin instead.\n";
-    return r;
-  })();
-
-  const copy = () => {
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  return (
-    <div className="card">
-      <div className="card-head">
-        <span className="card-head-label">Slack Response Template</span>
-        <button className="btn-ghost" onClick={copy}>
-          {copied ? <><Ico.Check /> Copied</> : <><Ico.Copy /> Copy</>}
-        </button>
-      </div>
-      <div className="card-body">
-        <pre className="slack-pre">{text}</pre>
-      </div>
-    </div>
-  );
-};
 
 /* ─── Collapsible ────────────────────────────────────────────────────────── */
 
@@ -404,8 +348,6 @@ export default function App() {
     } finally { setDomainListLoading(false); }
   };
 
-  const prod    = result?.domains.filter(d => d.env === "prod")  ?? [];
-  const nonprod = result?.domains.filter(d => d.env !== "prod")  ?? [];
 
   return (
     <div className="page">
@@ -508,37 +450,37 @@ export default function App() {
 
             <EnvGrid environments={result.environments} summary={result.summary} />
 
-            {/* Domain check */}
+            {/* Domain check — one section per environment */}
             <div className="card">
               <div className="card-head">
                 <span className="card-head-label">
                   <Ico.List />Domain Check
-                  <span className="count-badge">{result.domains.length}</span>
+                  <span className="count-badge">{result.summary.total_domains}</span>
                 </span>
                 <span className="card-head-meta">aht @{result.customer} domains:check</span>
               </div>
 
-              {prod.length > 0 && (
-                <>
-                  <div className="domain-section-label">
-                    <span className="dot d-neutral" />Production
-                  </div>
-                  <DomainTable domains={prod} />
-                </>
-              )}
-              {nonprod.length > 0 && (
-                <>
-                  <div className="domain-section-label">
-                    <span className="dot d-neutral" />Non-production
-                  </div>
-                  <DomainTable domains={nonprod} />
-                </>
-              )}
-              {result.domains.length === 0 && (
+              {Object.keys(result.environments).length === 0 && (
                 <div className="card-body" style={{ color:"var(--t2)", fontSize:"0.82rem" }}>
                   No domains found.
                 </div>
               )}
+
+              {Object.keys(result.environments).map(envName => {
+                const envDomains = result.domains.filter(d => d.env === envName);
+                if (envDomains.length === 0) return null;
+                const envOk = (result.summary.env_repointed || {})[envName] ?? true;
+                return (
+                  <div key={envName}>
+                    <div className="domain-section-label">
+                      <span className={`dot ${envOk ? "d-ok" : "d-error"}`} />
+                      <EnvBadge env={envName} />
+                      <span style={{ color: "var(--t2)" }}>{envDomains.length} domain(s)</span>
+                    </div>
+                    <DomainTable domains={envDomains} />
+                  </div>
+                );
+              })}
 
               {result.domain_list?.length > 0 && (
                 <Coll icon={<Ico.List />} label={`Domain aliases · ${result.domain_list.length} found`}>

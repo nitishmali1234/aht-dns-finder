@@ -203,29 +203,37 @@ def handle_full_check(username):
     dc_output = run_cmd(["aht", f"@{username}", "dc"])
     domains = parse_dc_output(dc_output)
 
-    # Only count environments that app:info knows about — filters out [vcs], [svn], etc.
+    # Group domains by env — only envs known from application:info (filters vcs, svn, etc.)
     known_envs = set(envs.keys())
-    prod    = [d for d in domains if d['env'] == 'prod']
-    nonprod = [d for d in domains if d['env'] != 'prod' and d['env'] in known_envs]
-
-    # CDN domains (cloudflare/akamai) can't be IP-matched but aren't a repointing failure
     OK_STATUSES = {'ok_a', 'ok_cname', 'cloudflare', 'cloudflare_ns', 'akamai'}
-    prod_ok  = all(d['matches'] or d['status'] in OK_STATUSES for d in prod)    if prod    else True
-    nprod_ok = all(d['matches'] or d['status'] in OK_STATUSES for d in nonprod) if nonprod else True
+
+    domains_by_env = {}
+    for d in domains:
+        if d['env'] in known_envs:
+            domains_by_env.setdefault(d['env'], []).append(d)
+
+    # Per-env repointing status
+    env_repointed = {
+        env: all(d['matches'] or d['status'] in OK_STATUSES for d in ds) if ds else True
+        for env, ds in domains_by_env.items()
+    }
+    all_repointed = all(env_repointed.values()) if env_repointed else True
 
     issues, warnings = [], []
-    if not prod_ok  and prod:    issues.append("Production domains have NOT been repointed")
-    if not nprod_ok and nonprod: issues.append("Non-production domains have NOT been repointed")
+    for env, ok in env_repointed.items():
+        if not ok:
+            issues.append(f"{env.capitalize()} domains have NOT been repointed")
 
-    cdn_domains     = [d for d in domains if d['status'] == 'cloudflare']
-    missing_edge    = [d for d in domains if d['status'] == 'missing_edge']
-    if cdn_domains:  warnings.append(f"{len(cdn_domains)} domain(s) using Cloudflare CDN - manual verification required")
+    cdn_domains  = [d for d in domains if d['status'] in ('cloudflare', 'cloudflare_ns')]
+    missing_edge = [d for d in domains if d['status'] == 'missing_edge']
+    if cdn_domains:  warnings.append(f"{len(cdn_domains)} domain(s) using Cloudflare CDN — manual verification required")
     if missing_edge: issues.append(f"{len(missing_edge)} domain(s) missing Edge Cluster A record")
 
-    prod_eip  = env_eips.get('prod')
-    nprod_eip = env_eips.get('dev') or env_eips.get('test') or env_eips.get('stage')
-    if prod_eip and nprod_eip and prod_eip != nprod_eip:
-        warnings.append(f"Different EIPs: Prod ({prod_eip}) vs Non-Prod ({nprod_eip})")
+    # Warn if envs share the same EIP vs different EIPs
+    unique_eips = set(v for v in env_eips.values() if v)
+    if len(unique_eips) > 1:
+        eip_summary = ", ".join(f"{e}: {env_eips[e]}" for e in env_eips if env_eips[e])
+        warnings.append(f"Different EIPs across environments — {eip_summary}")
 
     domain_list_output = run_cmd(["aht", f"@{username}", "domains:list"])
     domain_list = parse_domain_list_output(domain_list_output)
@@ -235,10 +243,10 @@ def handle_full_check(username):
         'environments': balancer_details, 'eips': env_eips,
         'domains': domains, 'domain_list': domain_list,
         'summary': {
-            'all_repointed': prod_ok and nprod_ok,
-            'prod_repointed': prod_ok, 'non_prod_repointed': nprod_ok,
-            'total_domains': len(prod) + len(nonprod),
-            'prod_domains_count': len(prod), 'non_prod_domains_count': len(nonprod),
+            'all_repointed': all_repointed,
+            'env_repointed': env_repointed,
+            'domains_by_env': {env: len(ds) for env, ds in domains_by_env.items()},
+            'total_domains': sum(len(ds) for ds in domains_by_env.values()),
             'issues': issues, 'warnings': warnings,
             'cdn_detected': len(cdn_domains) > 0,
             'has_dedicated_balancers': any(e['type'] == 'dedicated' for e in envs.values()),
