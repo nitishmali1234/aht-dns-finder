@@ -638,36 +638,50 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
     schedulePoll(id, d.device_code, d.interval || 5, Date.now() + (d.expires_in || 300) * 1000);
   };
 
-  /* ── Direct PKCE attempt (used after redirect URI has been registered) ── */
-  const tryPKCE = async (id) => {
-    if (!id) { setErr("Enter your Acquia Client ID."); setPhase("form"); return; }
-    setErr(null); setPhase("trying"); setStatusMsg("Opening Acquia login…");
-    try {
-      const { code, verifier, redirectUri: ru } = await launchPKCE(id);
-      setStatusMsg("Completing sign-in…");
-      const data   = await exchangePKCECode(id, code, verifier, ru);
-      const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
-      await new Promise(ok => chrome.storage.local.set({
-        acquia_client_id: id, acquia_token: data.access_token,
-        acquia_token_exp: expiry, acquia_refresh: data.refresh_token ?? null,
-      }, ok));
-      _token = data.access_token; _tokenExp = expiry;
-      onSave(id);
-    } catch (e) {
-      const isRedirectIssue = /could not be loaded|not approve|cancelled|closed/i.test(e.message);
-      if (isRedirectIssue) { setPhase("redirect_needed"); return; }
-      setErr(e.message); setPhase("form");
-    }
+  /* ── "Try Again" after redirect URI registration — re-runs full cascade ── */
+  const tryAgain = () => connect();
+
+  /* ── Shared: save token data from any flow ── */
+  const saveToken = async (id, sec, data) => {
+    const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
+    await new Promise(ok => chrome.storage.local.set({
+      acquia_client_id:     id,
+      acquia_client_secret: sec || null,
+      acquia_token:         data.access_token,
+      acquia_token_exp:     expiry,
+      acquia_refresh:       data.refresh_token ?? null,
+    }, ok));
+    _token = data.access_token; _tokenExp = expiry;
   };
 
-  /* ── Connect button handler — cascades: client_credentials → device_code → PKCE ── */
+  /* ── Connect: tab-inject → client_creds (Okta) → device → PKCE ── */
   const connect = async () => {
     const id  = clientId.trim();
     const sec = clientSecret.trim();
     if (!id) { setErr("Enter your Acquia Client ID."); return; }
     setErr(null); setPhase("trying");
 
-    /* 1. client_credentials — fast, silent, needs secret */
+    /* 1. Inject into a cloud.acquia.com tab — Origin: cloud.acquia.com bypasses
+          Acquia's "browser request" check on accounts.acquia.com/api/auth/oauth/token */
+    if (sec) {
+      setStatusMsg("Connecting via Acquia Cloud…");
+      const resp = await bgMsg({ type: "ACQUIA_TAB_AUTH", clientId: id, clientSecret: sec });
+
+      if (resp?.body === 'NOT_LOGGED_IN') {
+        setErr("Please log in to cloud.acquia.com in any browser tab, then click Connect again.");
+        setPhase("form"); return;
+      }
+
+      try {
+        const data = parseAuthResp(resp);
+        await saveToken(id, sec, data);
+        onSave(id); return;
+      } catch {
+        /* tab auth failed for another reason — fall through */
+      }
+    }
+
+    /* 2. Direct client_credentials on Okta (works if Acquia ever enables it) */
     if (sec) {
       setStatusMsg("Trying API key auth…");
       try {
@@ -676,31 +690,20 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
       } catch (e) {
         const wrongSecret = /\b401\b/.test(e.message) && !/pkce|proof key|unauthorized_client/i.test(e.message);
         if (wrongSecret) { setErr(e.message); setPhase("form"); return; }
-        /* 403 or grant-type-not-allowed → continue */
       }
     }
 
-    /* 2. Device Code — no redirect URI needed */
+    /* 3. Device Code flow */
     setStatusMsg("Trying device flow…");
-    try {
-      await startDeviceFlow(id);
-      return; // sets phase to device_waiting if it worked
-    } catch {
-      /* 403 / not enabled → fall through to PKCE */
-    }
+    try { await startDeviceFlow(id); return; } catch { /* fall through */ }
 
-    /* 3. PKCE Authorization Code — opens Acquia login in a popup */
+    /* 4. PKCE Authorization Code — browser popup */
     setStatusMsg("Opening Acquia login…");
     try {
       const { code, verifier, redirectUri } = await launchPKCE(id);
       setStatusMsg("Completing sign-in…");
-      const data   = await exchangePKCECode(id, code, verifier, redirectUri);
-      const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
-      await new Promise(ok => chrome.storage.local.set({
-        acquia_client_id: id, acquia_token: data.access_token,
-        acquia_token_exp: expiry, acquia_refresh: data.refresh_token ?? null,
-      }, ok));
-      _token = data.access_token; _tokenExp = expiry;
+      const data = await exchangePKCECode(id, code, verifier, redirectUri);
+      await saveToken(id, sec, data);
       onSave(id);
     } catch (e) {
       const isRedirectIssue = /could not be loaded|not approve|cancelled|closed/i.test(e.message);
@@ -756,7 +759,7 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
             </div>
 
             <button className="btn-primary" style={{ width:"100%", marginTop:18 }}
-              onClick={() => tryPKCE(clientId.trim())}>
+              onClick={tryAgain}>
               I've added it — Try Again
             </button>
             <button className="btn-ghost" style={{ width:"100%", marginTop:10 }} onClick={goBack}>
