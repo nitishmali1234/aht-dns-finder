@@ -15,25 +15,57 @@ let _tokenExp = 0;
 
 async function getToken(key, secret) {
   if (_token && Date.now() < _tokenExp) return _token;
-  const res = await fetch(ACQUIA_AUTH, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=client_credentials&client_id=${encodeURIComponent(key)}&client_secret=${encodeURIComponent(secret)}`,
-  });
-  if (!res.ok) throw new Error("Invalid API credentials — check your key and secret.");
+
+  let res;
+  try {
+    res = await fetch(ACQUIA_AUTH, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `grant_type=client_credentials&client_id=${encodeURIComponent(key)}&client_secret=${encodeURIComponent(secret)}`,
+    });
+  } catch (netErr) {
+    throw new Error(`Network error reaching auth server: ${netErr.message}. Check your internet connection.`);
+  }
+
+  if (!res.ok) {
+    let body = "";
+    try { body = await res.text(); } catch {}
+    // Parse JSON error if available
+    try {
+      const j = JSON.parse(body);
+      body = j.error_description || j.message || j.error || body;
+    } catch {}
+    throw new Error(`Auth failed (HTTP ${res.status}): ${body || res.statusText}`);
+  }
+
   const data = await res.json();
+  if (!data.access_token) throw new Error("Auth server responded but returned no token. Verify your Client ID and Secret.");
+
   _token    = data.access_token;
-  _tokenExp = Date.now() + (data.expires_in - 60) * 1000;
+  _tokenExp = Date.now() + ((data.expires_in ?? 7200) - 60) * 1000;
   return _token;
 }
 
 /* ─── Acquia Cloud API helpers ───────────────────────────────────────────── */
 
 async function acqGet(token, path) {
-  const res = await fetch(`${ACQUIA_API}${path}`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-  });
-  if (!res.ok) throw new Error(`Acquia API ${res.status} on ${path}`);
+  let res;
+  try {
+    res = await fetch(`${ACQUIA_API}${path}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    });
+  } catch (netErr) {
+    throw new Error(`Network error: ${netErr.message}`);
+  }
+  if (!res.ok) {
+    let body = "";
+    try { body = await res.text(); } catch {}
+    try {
+      const j = JSON.parse(body);
+      body = j.message || j.error || body;
+    } catch {}
+    throw new Error(`Acquia API error (${res.status}) on ${path}: ${body || res.statusText}`);
+  }
   return res.json();
 }
 
