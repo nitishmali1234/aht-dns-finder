@@ -66,6 +66,53 @@ async function refreshViaBackground(clientId, refreshTok) {
   return _token;
 }
 
+/* ─── PKCE Authorization Code flow ──────────────────────────────────────── */
+
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+async function generatePKCE() {
+  const arr = new Uint8Array(32);
+  crypto.getRandomValues(arr);
+  const verifier  = b64url(arr.buffer);
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  return { verifier, challenge };
+}
+
+const ACQUIA_AUTH_URL = 'https://id.acquia.com/oauth2/default/v1/authorize';
+
+async function launchPKCE(clientId) {
+  const { verifier, challenge } = await generatePKCE();
+  const redirectUri = chrome.identity.getRedirectURL();
+  const authUrl = ACQUIA_AUTH_URL + '?' + new URLSearchParams({
+    response_type:         'code',
+    client_id:             clientId,
+    redirect_uri:          redirectUri,
+    code_challenge:        challenge,
+    code_challenge_method: 'S256',
+    state:                 b64url(crypto.getRandomValues(new Uint8Array(8)).buffer),
+  });
+  const result = await new Promise((resolve, reject) =>
+    chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, url => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else if (!url) reject(new Error("Authorization was cancelled."));
+      else resolve(url);
+    })
+  );
+  const params = new URL(result).searchParams;
+  if (params.get('error')) throw new Error(params.get('error_description') || params.get('error'));
+  const code = params.get('code');
+  if (!code) throw new Error("No authorization code returned.");
+  return { code, verifier, redirectUri };
+}
+
+async function exchangePKCECode(clientId, code, codeVerifier, redirectUri) {
+  const resp = await bgMsg({ type: 'ACQUIA_CODE_EXCHANGE', clientId, code, codeVerifier, redirectUri });
+  return parseAuthResp(resp);
+}
+
 /* ─── Get token: memory → storage → refresh → re-auth → NEEDS_AUTH ──────── */
 
 async function getToken() {
@@ -591,33 +638,56 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
     schedulePoll(id, d.device_code, d.interval || 5, Date.now() + (d.expires_in || 300) * 1000);
   };
 
-  /* ── Connect button handler ── */
+  /* ── Connect button handler — cascades: client_credentials → device_code → PKCE ── */
   const connect = async () => {
     const id  = clientId.trim();
     const sec = clientSecret.trim();
     if (!id) { setErr("Enter your Acquia Client ID."); return; }
     setErr(null); setPhase("trying");
 
-    /* First try client_credentials (works if Okta allows it for this app) */
+    /* 1. client_credentials — fast, silent, needs secret */
     if (sec) {
-      setStatusMsg("Trying API credentials…");
+      setStatusMsg("Trying API key auth…");
       try {
         await authViaBackground(id, sec);
         onSave(id); return;
       } catch (e) {
-        // 401 with wrong credentials → show error and stop
-        // 403 or PKCE/unauthorized_client → this grant type isn't allowed for this app → try device flow
-        const isCredentialError = /401/.test(e.message) && !/pkce|proof key|unauthorized_client/i.test(e.message);
-        if (isCredentialError) { setErr(e.message); setPhase("form"); return; }
-        /* Grant type not allowed (403 / unauthorized_client / PKCE) → fall through to device flow */
+        const wrongSecret = /\b401\b/.test(e.message) && !/pkce|proof key|unauthorized_client/i.test(e.message);
+        if (wrongSecret) { setErr(e.message); setPhase("form"); return; }
+        /* 403 or grant-type-not-allowed → continue */
       }
     }
 
-    /* Device Code flow — no redirect URI needed */
+    /* 2. Device Code — no redirect URI needed */
+    setStatusMsg("Trying device flow…");
     try {
       await startDeviceFlow(id);
+      return; // sets phase to device_waiting if it worked
+    } catch {
+      /* 403 / not enabled → fall through to PKCE */
+    }
+
+    /* 3. PKCE Authorization Code — opens Acquia login in a popup */
+    setStatusMsg("Opening Acquia login…");
+    try {
+      const { code, verifier, redirectUri } = await launchPKCE(id);
+      setStatusMsg("Completing sign-in…");
+      const data   = await exchangePKCECode(id, code, verifier, redirectUri);
+      const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
+      await new Promise(ok => chrome.storage.local.set({
+        acquia_client_id: id, acquia_token: data.access_token,
+        acquia_token_exp: expiry, acquia_refresh: data.refresh_token ?? null,
+      }, ok));
+      _token = data.access_token; _tokenExp = expiry;
+      onSave(id);
     } catch (e) {
-      setErr(e.message); setPhase("form");
+      let msg = e.message;
+      if (/could not be loaded|cancelled|closed/i.test(msg)) {
+        msg = "Acquia login popup was closed or blocked. If it showed an error about 'redirect URI', "
+            + "please contact your Acquia admin to register this URI for your API token: "
+            + chrome.identity.getRedirectURL();
+      }
+      setErr(msg); setPhase("form");
     }
   };
 

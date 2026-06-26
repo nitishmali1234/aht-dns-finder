@@ -40,6 +40,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'ACQUIA_CODE_EXCHANGE') {
+    post(TOKEN_URL, {
+      grant_type:    'authorization_code',
+      client_id:     msg.clientId,
+      code:          msg.code,
+      code_verifier: msg.codeVerifier,
+      redirect_uri:  msg.redirectUri,
+    }, sendResponse);
+    return true;
+  }
+
   if (msg.type === 'ACQUIA_REFRESH') {
     post(TOKEN_URL, {
       grant_type:    'refresh_token',
