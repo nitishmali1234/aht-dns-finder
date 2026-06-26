@@ -6,7 +6,7 @@ import "./App.css";
 
 const ACQUIA_API    = "https://cloud.acquia.com/api";
 const ACQUIA_AUTH   = "https://accounts.acquia.com/api/auth/oauth/token";
-const ACQUIA_AUTHZ  = "https://accounts.acquia.com/api/auth/oauth/authorize";
+const ACQUIA_DEVICE = "https://accounts.acquia.com/api/auth/oauth/device/code";
 const CF_DNS        = "https://cloudflare-dns.com/dns-query";
 
 /* ─── Token cache ────────────────────────────────────────────────────────── */
@@ -14,133 +14,116 @@ const CF_DNS        = "https://cloudflare-dns.com/dns-query";
 let _token   = null;
 let _tokenExp = 0;
 
-/* ─── PKCE helpers ───────────────────────────────────────────────────────── */
+/* ─── Device Code flow (RFC 8628) — no redirect URI needed ──────────────── */
 
-function b64url(buf) {
-  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-  let s = "";
-  bytes.forEach(b => (s += String.fromCharCode(b)));
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-async function generatePKCE() {
-  const verifier  = b64url(crypto.getRandomValues(new Uint8Array(64)));
-  const hash      = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-  const challenge = b64url(new Uint8Array(hash));
-  return { verifier, challenge };
-}
-
-/* ─── Acquia OAuth: Authorization Code + PKCE ───────────────────────────── */
-
-async function launchAcquiaAuth(clientId) {
-  const { verifier, challenge } = await generatePKCE();
-  const redirectUri = `https://${chrome.runtime.id}.chromiumapp.org/`;
-
-  const authUrl = ACQUIA_AUTHZ + "?" + new URLSearchParams({
-    client_id:             clientId,
-    response_type:         "code",
-    redirect_uri:          redirectUri,
-    code_challenge:        challenge,
-    code_challenge_method: "S256",
-  });
-
-  // Opens Acquia login page in a Chrome-managed popup
-  const cbUrl = await new Promise((resolve, reject) =>
-    chrome.identity.launchWebAuthFlow(
-      { url: authUrl, interactive: true },
-      url => chrome.runtime.lastError
-        ? reject(new Error(chrome.runtime.lastError.message))
-        : resolve(url)
-    )
-  );
-
-  if (!cbUrl) throw new Error("Authentication was cancelled.");
-
-  const cbParams = new URL(cbUrl).searchParams;
-  const authErr  = cbParams.get("error");
-  if (authErr) throw new Error(`Acquia auth error: ${cbParams.get("error_description") || authErr}`);
-
-  const code = cbParams.get("code");
-  if (!code) throw new Error("No authorization code in redirect — please try again.");
-
-  // Exchange code + verifier → token
+async function startDeviceAuth(clientId) {
   let res;
   try {
-    res = await fetch(ACQUIA_AUTH, {
-      method: "POST",
+    res = await fetch(ACQUIA_DEVICE, {
+      method:  "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type:    "authorization_code",
-        client_id:     clientId,
-        code,
-        redirect_uri:  redirectUri,
-        code_verifier: verifier,
-      }).toString(),
+      body:    new URLSearchParams({ client_id: clientId }).toString(),
     });
-  } catch (e) {
-    throw new Error(`Network error during token exchange: ${e.message}`);
-  }
+  } catch (e) { throw new Error(`Network error: ${e.message}`); }
 
   if (!res.ok) {
     let body = "";
     try { body = await res.text(); } catch {}
     try { const j = JSON.parse(body); body = j.error_description || j.message || j.error || body; } catch {}
-    throw new Error(`Token exchange failed (${res.status}): ${body || res.statusText}`);
+    throw new Error(`Could not start authorization (${res.status}): ${body || res.statusText}`);
   }
 
-  const data   = await res.json();
-  const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
+  const d = await res.json();
+  return {
+    device_code:               d.device_code,
+    user_code:                 d.user_code,
+    verification_uri:          d.verification_uri,
+    verification_uri_complete: d.verification_uri_complete || d.verification_uri,
+    expires_in:                d.expires_in || 300,
+    interval:                  d.interval   || 5,
+  };
+}
 
-  await new Promise(ok =>
-    chrome.storage.local.set({
-      acquia_client_id: clientId,
-      acquia_token:     data.access_token,
-      acquia_token_exp: expiry,
-      acquia_refresh:   data.refresh_token ?? null,
-    }, ok)
-  );
+async function pollDeviceToken(clientId, deviceCode, interval, onPoll) {
+  const deadline = Date.now() + 5 * 60_000;
+  let   wait     = interval;
 
-  _token    = data.access_token;
-  _tokenExp = expiry;
-  return data.access_token;
+  while (Date.now() < deadline) {
+    const delay = wait;
+    // eslint-disable-next-line no-loop-func
+    await new Promise(r => setTimeout(r, delay * 1000));
+    onPoll?.();
+
+    let res, data;
+    try {
+      res  = await fetch(ACQUIA_AUTH, {
+        method:  "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body:    new URLSearchParams({
+          grant_type:  "urn:ietf:params:oauth:grant-type:device_code",
+          client_id:   clientId,
+          device_code: deviceCode,
+        }).toString(),
+      });
+      data = await res.json();
+    } catch (e) { throw new Error(`Network error while polling: ${e.message}`); }
+
+    if (data.access_token) {
+      const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
+      await new Promise(ok => chrome.storage.local.set({
+        acquia_client_id: clientId,
+        acquia_token:     data.access_token,
+        acquia_token_exp: expiry,
+        acquia_refresh:   data.refresh_token ?? null,
+      }, ok));
+      _token    = data.access_token;
+      _tokenExp = expiry;
+      return _token;
+    }
+
+    if (data.error === "authorization_pending") continue;
+    if (data.error === "slow_down") { wait = Math.min(wait + 5, 30); continue; }
+    if (data.error === "expired_token") throw new Error("Code expired — please try again.");
+    if (data.error === "access_denied")  throw new Error("Authorization was denied.");
+    if (data.error) throw new Error(data.error_description || data.error);
+  }
+
+  throw new Error("Timed out waiting (5 min). Please try again.");
 }
 
 /* ─── Silent token refresh ───────────────────────────────────────────────── */
 
-async function refreshAcquiaToken(clientId, refreshToken) {
+async function refreshToken(clientId, refreshTok) {
   const res = await fetch(ACQUIA_AUTH, {
-    method: "POST",
+    method:  "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
+    body:    new URLSearchParams({
       grant_type:    "refresh_token",
       client_id:     clientId,
-      refresh_token: refreshToken,
+      refresh_token: refreshTok,
     }).toString(),
   });
   if (!res.ok) throw new Error("Refresh failed");
   const data   = await res.json();
   const expiry = Date.now() + ((data.expires_in ?? 7200) - 120) * 1000;
-  await new Promise(ok =>
-    chrome.storage.local.set({
-      acquia_token:     data.access_token,
-      acquia_token_exp: expiry,
-      acquia_refresh:   data.refresh_token ?? refreshToken,
-    }, ok)
-  );
+  await new Promise(ok => chrome.storage.local.set({
+    acquia_token:     data.access_token,
+    acquia_token_exp: expiry,
+    acquia_refresh:   data.refresh_token ?? refreshTok,
+  }, ok));
   _token    = data.access_token;
   _tokenExp = expiry;
   return _token;
 }
 
-/* ─── Get token (in-memory → storage → refresh → throw NEEDS_AUTH) ──────── */
+/* ─── Get token: memory → storage → refresh → NEEDS_AUTH ────────────────── */
 
 async function getToken() {
   if (_token && Date.now() < _tokenExp) return _token;
 
   const stored = await new Promise(ok =>
     chrome.storage.local.get(
-      ["acquia_token", "acquia_token_exp", "acquia_refresh", "acquia_client_id"],
-      ok
+      ["acquia_token", "acquia_token_exp", "acquia_refresh", "acquia_client_id"], ok
     )
   );
 
@@ -151,8 +134,8 @@ async function getToken() {
   }
 
   if (stored.acquia_refresh && stored.acquia_client_id) {
-    try { return await refreshAcquiaToken(stored.acquia_client_id, stored.acquia_refresh); }
-    catch {} // fall through → re-login
+    try { return await refreshToken(stored.acquia_client_id, stored.acquia_refresh); }
+    catch {}
   }
 
   throw new Error("NEEDS_AUTH");
@@ -594,36 +577,96 @@ const EnvGrid = ({ environments }) => (
 /* ─── Settings / Connect page ────────────────────────────────────────────── */
 
 const SettingsPage = ({ onSave, clientId: existingId }) => {
-  const [clientId, setClientId] = useState(existingId || "");
-  const [loading,  setLoading]  = useState(false);
-  const [err,      setErr]      = useState(null);
-  const [ok,       setOk]       = useState(false);
+  const [clientId,   setClientId]   = useState(existingId || "");
+  const [loading,    setLoading]    = useState(false);
+  const [deviceInfo, setDeviceInfo] = useState(null); // { user_code, verification_uri, ... }
+  const [polls,      setPolls]      = useState(0);
+  const [err,        setErr]        = useState(null);
 
-  const connect = async () => {
+  const startAuth = async () => {
     const id = clientId.trim();
     if (!id) { setErr("Enter your Acquia Client ID."); return; }
-    setLoading(true); setErr(null); setOk(false);
+    setErr(null); setLoading(true);
     try {
-      _token = null;
-      await launchAcquiaAuth(id);
-      setOk(true);
-      setTimeout(() => onSave(id), 700);
+      const info = await startDeviceAuth(id);
+      setDeviceInfo(info);
+      setLoading(false);
+      await pollDeviceToken(id, info.device_code, info.interval, () => setPolls(p => p + 1));
+      onSave(id);
     } catch (e) {
       setErr(e.message);
-    } finally {
+      setDeviceInfo(null);
       setLoading(false);
     }
   };
 
+  const cancel = () => { setDeviceInfo(null); setErr(null); setPolls(0); };
+
+  /* ── Waiting for user to approve on Acquia website ── */
+  if (deviceInfo) return (
+    <div className="page">
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="topbar-icon"><Ico.Network /></div>
+          <span className="topbar-title">Acquia DNS Finder</span>
+          <div className="topbar-right"><span className="topbar-tag">Authorizing</span></div>
+        </div>
+      </header>
+      <main className="main" style={{ maxWidth: 560 }}>
+        <div className="card">
+          <div className="card-head">
+            <span className="card-head-label"><Ico.Key /> Authorize in Acquia</span>
+          </div>
+          <div className="card-body">
+            <p className="settings-intro">
+              Open the link below in your browser, then enter the code when prompted by Acquia.
+            </p>
+
+            <div className="device-box">
+              <div className="device-box-label">Step 1 — Open this URL</div>
+              <div className="device-url">{deviceInfo.verification_uri}</div>
+              <button
+                className="btn-ghost"
+                style={{ marginTop: 10, fontSize: "0.78rem" }}
+                onClick={() => chrome.tabs.create({ url: deviceInfo.verification_uri_complete })}
+              >
+                Open in new tab →
+              </button>
+            </div>
+
+            <div className="device-box" style={{ marginTop: 14, textAlign: "center" }}>
+              <div className="device-box-label">Step 2 — Enter this code</div>
+              <div className="device-code">{deviceInfo.user_code}</div>
+            </div>
+
+            <div className="device-status">
+              <span className="spin-light" />
+              Waiting for you to approve… <span style={{ color:"var(--t3)" }}>({polls} check{polls !== 1 ? "s" : ""})</span>
+            </div>
+
+            {err && (
+              <div className="alert alert-error" style={{ marginTop: 14 }}>
+                <Ico.AlertTri />{err}
+              </div>
+            )}
+
+            <button className="btn-ghost" style={{ width: "100%", marginTop: 14 }} onClick={cancel}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+
+  /* ── Client ID input ── */
   return (
     <div className="page">
       <header className="topbar">
         <div className="topbar-inner">
           <div className="topbar-icon"><Ico.Network /></div>
           <span className="topbar-title">Acquia DNS Finder</span>
-          <div className="topbar-right">
-            <span className="topbar-tag">Setup</span>
-          </div>
+          <div className="topbar-right"><span className="topbar-tag">Setup</span></div>
         </div>
       </header>
       <main className="main" style={{ maxWidth: 560 }}>
@@ -633,8 +676,8 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
           </div>
           <div className="card-body">
             <p className="settings-intro">
-              Enter your Acquia API Client ID, then click <strong>Connect</strong> — you will be taken to
-              the Acquia login page to authorize access. No password is stored by this extension.
+              Enter your Acquia API Client ID and click <strong>Connect</strong>. You'll get a short code
+              to enter on Acquia's website — no popup, no redirect.
             </p>
 
             <div className="settings-field">
@@ -644,8 +687,8 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
                 type="text"
                 placeholder="e62adfc6-c7ee-403b-ba40-172c90e792cf"
                 value={clientId}
-                onChange={e => setClientId(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && !loading && connect()}
+                onChange={e => { setClientId(e.target.value); setErr(null); }}
+                onKeyDown={e => e.key === "Enter" && !loading && startAuth()}
                 autoFocus
               />
             </div>
@@ -655,27 +698,21 @@ const SettingsPage = ({ onSave, clientId: existingId }) => {
                 <Ico.AlertTri />{err}
               </div>
             )}
-            {ok && (
-              <div className="alert" style={{ background:"var(--green-dim)", borderColor:"var(--green-border)", color:"var(--green)", marginBottom:14 }}>
-                <Ico.Check /> Connected successfully!
-              </div>
-            )}
 
-            <button className="btn-primary" style={{ width:"100%" }} onClick={connect} disabled={loading}>
-              {loading ? <><span className="spin" />Opening Acquia login…</> : <>Connect with Acquia</>}
+            <button className="btn-primary" style={{ width: "100%" }} onClick={startAuth} disabled={loading}>
+              {loading ? <><span className="spin" />Starting…</> : <>Connect with Acquia</>}
             </button>
 
             <div className="settings-how">
-              <strong style={{ color:"var(--t1)", display:"block", marginBottom:8 }}>How to get your Client ID</strong>
+              <strong style={{ color:"var(--t1)", display:"block", marginBottom:8 }}>How to find your Client ID</strong>
               <ol>
                 <li>Go to <strong>cloud.acquia.com</strong></li>
                 <li>Click your name (top-right) → <strong>Account settings</strong></li>
                 <li>Click <strong>API tokens</strong> → <strong>Create token</strong></li>
-                <li>Copy the <strong>Client ID</strong> (UUID) and paste it above</li>
-                <li>Click <strong>Connect</strong> — log in on the Acquia page that opens</li>
+                <li>Copy the <strong>Client ID</strong> (UUID) and paste above</li>
               </ol>
               <p style={{ marginTop:10, fontSize:"0.75rem", color:"var(--t3)" }}>
-                The Client Secret is not needed here — the extension uses OAuth PKCE, not the secret.
+                The Client Secret is not required — authorization happens on Acquia's website.
               </p>
             </div>
           </div>
