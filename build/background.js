@@ -1,118 +1,114 @@
+/* ── Passively capture the Bearer token from cloud.acquia.com API traffic ──
+   The Acquia Cloud UI stores its Okta token in memory (not localStorage),
+   so we intercept outgoing API requests to read it from the Authorization
+   header instead.                                                           */
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    const auth = details.requestHeaders?.find(
+      h => h.name.toLowerCase() === 'authorization'
+    );
+    if (auth?.value?.startsWith('Bearer ')) {
+      chrome.storage.session.set({
+        acquiaToken:   auth.value.slice(7),
+        acquiaTokenAt: Date.now(),
+      });
+    }
+  },
+  { urls: ['https://cloud.acquia.com/api/*'] },
+  ['requestHeaders', 'extraHeaders']
+);
+
+/* ── Extension icon → open UI in a new tab ──────────────────────────────── */
 chrome.action.onClicked.addListener(() => {
   chrome.tabs.create({ url: chrome.runtime.getURL('index.html') });
 });
 
-/* ── Find or open a logged-in cloud.acquia.com tab ─────────────────────── */
-async function ensureAcquiaTab() {
-  const existing = await chrome.tabs.query({ url: 'https://cloud.acquia.com/*' });
-  if (existing.length) return { tabId: existing[0].id, opened: false };
-
-  // Open in background, don't steal focus
-  const tab = await chrome.tabs.create({ url: 'https://cloud.acquia.com/', active: false });
-  const tabId = tab.id;
-
-  // Wait for page to finish loading (max 15s)
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(fn);
-      reject(new Error('cloud.acquia.com did not load in time'));
-    }, 15000);
-    function fn(id, info) {
-      if (id === tabId && info.status === 'complete') {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(fn);
-        resolve();
-      }
-    }
-    chrome.tabs.onUpdated.addListener(fn);
-  });
-
-  // If Okta redirected to login, the user isn't logged in
-  const loaded = await chrome.tabs.get(tabId).catch(() => null);
-  if (!loaded?.url?.startsWith('https://cloud.acquia.com/')) {
-    chrome.tabs.remove(tabId).catch(() => {});
-    return { tabId: null, opened: true, notLoggedIn: true };
+/* ── Return cached token if it's less than 25 minutes old ──────────────── */
+async function getCachedToken() {
+  const { acquiaToken, acquiaTokenAt } = await chrome.storage.session.get([
+    'acquiaToken', 'acquiaTokenAt',
+  ]);
+  if (acquiaToken && Date.now() - (acquiaTokenAt || 0) < 25 * 60 * 1000) {
+    return acquiaToken;
   }
-
-  // Give the Okta SDK time to populate storage (~3s is usually enough)
-  await new Promise(r => setTimeout(r, 3000));
-
-  return { tabId, opened: true };
+  return null;
 }
 
-/* ── Injected function: find token + call API ───────────────────────────── */
-async function callAcquiaApi(endpoint) {
-  // Deep-scan any Storage object for JWT strings (eyJ...)
-  function extractJWTs(storage) {
-    const found = [];
-    try {
-      for (let i = 0; i < storage.length; i++) {
-        const val = storage.getItem(storage.key(i));
-        if (!val) continue;
-        if (val.startsWith('eyJ') && val.length > 100) { found.push(val); continue; }
-        try {
-          const walk = (o, depth) => {
-            if (depth > 6 || o == null) return;
-            if (typeof o === 'string' && o.startsWith('eyJ') && o.length > 100) found.push(o);
-            else if (typeof o === 'object') Object.values(o).forEach(v => walk(v, depth + 1));
-          };
-          walk(JSON.parse(val), 0);
-        } catch {}
+/* ── Open cloud.acquia.com silently and wait for webRequest to capture a
+   fresh token from the page's own API calls on load.                       */
+async function acquireTokenViaBackgroundTab() {
+  const tab = await chrome.tabs.create({ url: 'https://cloud.acquia.com/', active: false });
+  const tabId = tab.id;
+  try {
+    // Wait for page to finish loading (max 15s)
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(onUpdate);
+        reject(new Error('cloud.acquia.com load timeout'));
+      }, 15000);
+      function onUpdate(id, info) {
+        if (id === tabId && info.status === 'complete') {
+          clearTimeout(timer);
+          chrome.tabs.onUpdated.removeListener(onUpdate);
+          resolve();
+        }
       }
-    } catch {}
-    return found;
+      chrome.tabs.onUpdated.addListener(onUpdate);
+    });
+
+    // If Okta redirected to the login page, the user isn't signed in
+    const loaded = await chrome.tabs.get(tabId).catch(() => null);
+    if (!loaded?.url?.startsWith('https://cloud.acquia.com/')) return null;
+
+    // Poll for up to 8s — the page will make API calls and webRequest will
+    // intercept the Authorization header automatically
+    const start = Date.now();
+    while (Date.now() - start < 8000) {
+      await new Promise(r => setTimeout(r, 400));
+      const { acquiaToken, acquiaTokenAt } = await chrome.storage.session.get([
+        'acquiaToken', 'acquiaTokenAt',
+      ]);
+      if (acquiaToken && acquiaTokenAt > start) return acquiaToken;
+    }
+    return null;
+  } finally {
+    chrome.tabs.remove(tabId).catch(() => {});
   }
-
-  const tokens = [...new Set([
-    ...extractJWTs(localStorage),
-    ...extractJWTs(sessionStorage),
-  ])].sort((a, b) => b.length - a.length); // longer = more likely access token
-
-  const BASE = 'https://cloud.acquia.com/api';
-
-  // Try each discovered token; fall back to cookie-only request
-  const attempts = [
-    ...tokens.map(t => ({ Accept: 'application/json', Authorization: `Bearer ${t}` })),
-    { Accept: 'application/json' }, // cookies only
-  ];
-
-  for (const headers of attempts) {
-    try {
-      const r = await fetch(`${BASE}${endpoint}`, { headers, credentials: 'include' });
-      if (r.ok) return { ok: true, status: r.status, body: await r.text() };
-      if (r.status === 401 || r.status === 403) continue; // wrong token, try next
-      return { ok: false, status: r.status, body: await r.text() };
-    } catch { continue; }
-  }
-
-  return { ok: false, error: 'NO_TOKEN' };
 }
 
 /* ── Message handler ────────────────────────────────────────────────────── */
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'ACQUIA_API_CALL') {
-    (async () => {
-      try {
-        const { tabId, opened, notLoggedIn } = await ensureAcquiaTab();
+  if (msg.type !== 'ACQUIA_API_CALL') return;
 
-        if (notLoggedIn) {
-          sendResponse({ ok: false, error: 'NOT_LOGGED_IN' });
-          return;
-        }
+  (async () => {
+    try {
+      // Use a cached token if available; otherwise open a background tab to get one
+      const token = (await getCachedToken()) ?? (await acquireTokenViaBackgroundTab());
 
-        const results = await chrome.scripting.executeScript({
-          target: { tabId },
-          func: callAcquiaApi,
-          args: [msg.endpoint],
-        });
-
-        if (opened) chrome.tabs.remove(tabId).catch(() => {});
-
-        sendResponse(results[0].result);
-      } catch (e) {
-        sendResponse({ ok: false, error: e.message });
+      if (!token) {
+        sendResponse({ ok: false, error: 'NOT_LOGGED_IN' });
+        return;
       }
-    })();
-    return true;
-  }
+
+      // Call the Acquia API directly from the service worker.
+      // host_permissions bypass CORS — no tab injection required.
+      const r = await fetch(`https://cloud.acquia.com/api${msg.endpoint}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+        },
+      });
+
+      // Evict a rejected token so the next call re-acquires a fresh one
+      if (r.status === 401 || r.status === 403) {
+        await chrome.storage.session.remove(['acquiaToken', 'acquiaTokenAt']);
+      }
+
+      sendResponse({ ok: r.ok, status: r.status, body: await r.text() });
+    } catch (e) {
+      sendResponse({ ok: false, error: e.message });
+    }
+  })();
+
+  return true; // keep message channel open for async sendResponse
 });

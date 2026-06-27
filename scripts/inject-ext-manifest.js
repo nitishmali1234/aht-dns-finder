@@ -9,7 +9,7 @@ const manifest = {
   key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmpYrZ6rmk7BI07BW8HCDNXb3BMSWcgYxm63uOvpL1YQXnDiA3otZjCvTLtqh0x9hdugiafx4JFBRcR1aN7q4cJU2PdA6sxip7eu3/yfUylulJvDRFKiihb5R6RrKezCjlX55/RPReukBjGcpyJ66hfX32+XEH/HOppUU+GkJQARw772SF1meNsoTJXPmEztrAfJLDy6ikggvUAjsf/K7EOfNDh6TI41YnZ/xZ7mbhHwir2diXZ51VWDlx4mncZK6MnN/Pm5gN/tBdd1/9dRVBIzIyGKMap9IXIYA7P0TGJbkANzRBFNaI1VNFP/crrzbs+bMfYC33jQAItPDtuwTcwIDAQAB",
   action: { default_title: "Acquia DNS Finder" },
   background: { service_worker: "background.js" },
-  permissions: ["storage", "tabs", "scripting"],
+  permissions: ["storage", "tabs", "webRequest"],
   host_permissions: [
     "https://cloud.acquia.com/*",
     "https://accounts.acquia.com/*",

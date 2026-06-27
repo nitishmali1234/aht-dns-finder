@@ -13,7 +13,7 @@
   "permissions": [
     "storage",
     "tabs",
-    "scripting"
+    "webRequest"
   ],
   "host_permissions": [
     "https://cloud.acquia.com/*",
