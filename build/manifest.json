@@ -13,8 +13,6 @@
   "permissions": [
     "storage",
     "tabs",
-    "identity",
-    "identity.email",
     "scripting"
   ],
   "host_permissions": [

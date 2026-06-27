@@ -215,20 +215,6 @@ const Ico = {
       <circle cx="7.5" cy="11" r="0.75" fill="currentColor"/>
     </svg>
   ),
-  Google: () => (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-      <path d="M15.68 8.18c0-.57-.05-1.12-.14-1.64H8v3.1h4.3a3.67 3.67 0 0 1-1.6 2.41v2h2.58c1.51-1.4 2.4-3.44 2.4-5.87z" fill="#4285F4"/>
-      <path d="M8 16c2.16 0 3.97-.71 5.3-1.93l-2.58-2a4.8 4.8 0 0 1-2.72.76c-2.09 0-3.86-1.41-4.49-3.31H.85v2.07A8 8 0 0 0 8 16z" fill="#34A853"/>
-      <path d="M3.51 9.52A4.8 4.8 0 0 1 3.26 8c0-.53.09-1.04.25-1.52V4.41H.85A8 8 0 0 0 0 8c0 1.29.31 2.51.85 3.59l2.66-2.07z" fill="#FBBC05"/>
-      <path d="M8 3.18c1.18 0 2.23.4 3.07 1.2l2.3-2.3C11.97.79 10.16 0 8 0A8 8 0 0 0 .85 4.41L3.51 6.48C4.14 4.59 5.91 3.18 8 3.18z" fill="#EA4335"/>
-    </svg>
-  ),
-  ExternalLink: () => (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-      <path d="M5 2H2a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-      <path d="M7.5 1H11v3.5M11 1L5.5 6.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-    </svg>
-  ),
   Settings: () => (
     <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
       <circle cx="7" cy="7" r="2.5" stroke="currentColor" strokeWidth="1.3"/>
@@ -417,100 +403,16 @@ const EnvGrid = ({ environments }) => (
   </div>
 );
 
-/* ─── NotAcquiaPage — shown when Chrome account isn't @acquia.com ─────────  */
-const NotAcquiaPage = ({ email }) => (
-  <div className="page">
-    <header className="topbar">
-      <div className="topbar-inner">
-        <div className="topbar-icon"><Ico.Network /></div>
-        <span className="topbar-title">Acquia DNS Finder</span>
-        <div className="topbar-right"><span className="topbar-tag">Internal</span></div>
-      </div>
-    </header>
-    <main className="main" style={{ maxWidth: 520 }}>
-      <div className="card">
-        <div className="card-body" style={{ textAlign: 'center', padding: '32px 24px' }}>
-          <div style={{ fontSize: 40, marginBottom: 16 }}>🔒</div>
-          <div style={{ fontWeight: 600, fontSize: '1rem', color: 'var(--t1)', marginBottom: 8 }}>
-            Acquia employees only
-          </div>
-          {email ? (
-            <p style={{ color: 'var(--t2)', fontSize: '0.85rem', lineHeight: 1.6 }}>
-              You're signed into Chrome as <strong>{email}</strong>.<br />
-              This extension requires an <strong>@acquia.com</strong> Google account.
-            </p>
-          ) : (
-            <p style={{ color: 'var(--t2)', fontSize: '0.85rem', lineHeight: 1.6 }}>
-              Sign in to Chrome with your <strong>@acquia.com</strong> Google account to use this extension.
-            </p>
-          )}
-          <p style={{ color: 'var(--t3)', fontSize: '0.78rem', marginTop: 12 }}>
-            Open Chrome settings → You and Google → Sign in to Chrome
-          </p>
-        </div>
-      </div>
-    </main>
-  </div>
-);
-
-/* ─── CloudLoginPrompt — inline card shown when cloud.acquia.com not open ── */
-const CloudLoginPrompt = ({ onRetry }) => (
-  <div className="card">
-    <div className="card-body">
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
-        <div style={{ fontSize: 28, lineHeight: 1 }}>🌐</div>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 600, color: 'var(--t1)', marginBottom: 6 }}>
-            Open cloud.acquia.com first
-          </div>
-          <p style={{ color: 'var(--t2)', fontSize: '0.83rem', lineHeight: 1.6, margin: 0 }}>
-            The extension reads your existing Acquia Cloud session — no extra login needed.
-            Open cloud.acquia.com in any tab and sign in, then run the check again.
-          </p>
-          <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
-            <button className="btn-primary" style={{ fontSize: '0.8rem' }}
-              onClick={() => chrome.tabs.create({ url: 'https://cloud.acquia.com/' })}>
-              <Ico.ExternalLink /> Open cloud.acquia.com
-            </button>
-            <button className="btn-ghost" style={{ fontSize: '0.8rem' }} onClick={onRetry}>
-              Try again
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-);
-
 /* ─── App ────────────────────────────────────────────────────────────────── */
 export default function App() {
-  // 'loading' | 'not_acquia' | 'ready'
-  const [authState, setAuthState] = useState('loading');
-  const [userEmail, setUserEmail] = useState('');
   const [customer,  setCustomer]  = useState('');
   const [loading,   setLoading]   = useState(false);
   const [scanStep,  setScanStep]  = useState(0);
   const [result,    setResult]    = useState(null);
   const [error,     setError]     = useState(null);
-  const [needsCloud, setNeedsCloud] = useState(false);
   const inputRef = useRef(null);
 
-  /* ── Verify @acquia.com Google account on mount ── */
-  useEffect(() => {
-    chrome.identity.getProfileUserInfo(info => {
-      const email = info?.email || '';
-      setUserEmail(email);
-      if (email.endsWith('@acquia.com')) {
-        setAuthState('ready');
-      } else {
-        setAuthState('not_acquia');
-      }
-    });
-  }, []);
-
-  useEffect(() => {
-    if (authState === 'ready' && inputRef.current) inputRef.current.focus();
-  }, [authState]);
+  useEffect(() => { inputRef.current?.focus(); }, []);
 
   /* ── Scan step timing ── */
   useEffect(() => {
@@ -526,13 +428,13 @@ export default function App() {
   const runCheck = async () => {
     const name = customer.trim();
     if (!name) { setError('Enter an application name.'); return; }
-    setLoading(true); setError(null); setResult(null); setNeedsCloud(false);
+    setLoading(true); setError(null); setResult(null);
     try {
       const data = await performCheck(name, setScanStep);
       setResult(data);
     } catch (e) {
       if (e.message === 'NOT_LOGGED_IN') {
-        setNeedsCloud(true);
+        setError('Not signed in to Acquia Cloud. Sign in at cloud.acquia.com and try again.');
       } else {
         setError(e.message);
       }
@@ -540,15 +442,6 @@ export default function App() {
       setLoading(false);
     }
   };
-
-  /* ── Render ── */
-  if (authState === 'loading') return (
-    <div className="page" style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'100vh' }}>
-      <span className="spin-light" style={{ width:24, height:24, borderWidth:3 }} />
-    </div>
-  );
-
-  if (authState === 'not_acquia') return <NotAcquiaPage email={userEmail} />;
 
   return (
     <div className="page">
@@ -559,7 +452,6 @@ export default function App() {
           <div className="topbar-icon"><Ico.Network /></div>
           <span className="topbar-title">Acquia DNS Finder</span>
           <div className="topbar-right">
-            <span className="user-email">{userEmail}</span>
             <div className="live-badge"><span className="live-dot" />Live</div>
             <span className="topbar-tag">Internal</span>
           </div>
@@ -580,7 +472,7 @@ export default function App() {
                   className="search-input"
                   type="text"
                   value={customer}
-                  onChange={e => { setCustomer(e.target.value); setError(null); setResult(null); setNeedsCloud(false); }}
+                  onChange={e => { setCustomer(e.target.value); setError(null); setResult(null); }}
                   onKeyDown={e => e.key === 'Enter' && !loading && runCheck()}
                   placeholder="iqstudent"
                   disabled={loading}
@@ -600,11 +492,6 @@ export default function App() {
             )}
           </div>
         </div>
-
-        {/* ── Cloud login prompt ───────────────────────────────────────── */}
-        {needsCloud && (
-          <CloudLoginPrompt onRetry={() => { setNeedsCloud(false); runCheck(); }} />
-        )}
 
         {/* ── Scan animation ──────────────────────────────────────────── */}
         {loading && <ScanCard step={scanStep} customer={customer.trim()} />}
