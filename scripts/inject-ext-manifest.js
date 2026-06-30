@@ -12,6 +12,9 @@ const manifest = {
   background: {
     service_worker: "background.js"
   },
+  permissions: [
+    "downloads"
+  ],
   host_permissions: [
     "http://localhost:8001/*"
   ],

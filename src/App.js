@@ -140,6 +140,61 @@ const DocRootError = ({ customer, message }) => (
   </div>
 );
 
+/* ─── Backend not running — one-time setup ───────────────── */
+
+const BackendSetupCard = () => {
+  const [downloaded, setDownloaded] = useState(false);
+
+  const downloadSetup = () => {
+    const url = chrome.runtime.getURL("AcquiaDNSFinderSetup.pkg");
+    if (window.chrome?.downloads) {
+      chrome.downloads.download({ url, filename: "AcquiaDNSFinderSetup.pkg", saveAs: false });
+    } else {
+      window.open(url, "_blank");
+    }
+    setDownloaded(true);
+  };
+
+  return (
+    <div className="card">
+      <div className="docroot-error">
+        <div className="err-icon-ring">
+          <Ico.AlertTri />
+        </div>
+        <div className="err-title">Backend Not Running</div>
+        <div className="err-msg">
+          This extension needs a small local helper running on your Mac to
+          drive the <code>aht</code> CLI. It looks like it isn't set up on
+          this machine yet — that's a one-time, no-terminal step.
+        </div>
+
+        <button className="btn-run" onClick={downloadSetup} style={{ margin: "4px auto 18px" }}>
+          <Ico.Search /> {downloaded ? "Download Again" : "Download Setup"}
+        </button>
+
+        <div className="setup-steps">
+          <div className="setup-step">
+            <span className="setup-step-n">1</span>
+            Click the button above — saves <code>AcquiaDNSFinderSetup.pkg</code> to your Downloads
+          </div>
+          <div className="setup-step">
+            <span className="setup-step-n">2</span>
+            Open it from Downloads and click through the installer (just like installing any Mac app)
+          </div>
+          <div className="setup-step">
+            <span className="setup-step-n">3</span>
+            Come back here and click <strong>Run Check</strong> again
+          </div>
+        </div>
+
+        <div className="err-hint" style={{ marginTop: 14 }}>
+          Requires <code>aht</code> and <code>php</code> already installed and on your PATH
+        </div>
+      </div>
+    </div>
+  );
+};
+
 /* ─── Status pill ────────────────────────────────────────── */
 
 const StatusPill = ({ status }) => {
@@ -406,7 +461,7 @@ export default function App() {
         setError({ type: "generic", message: data.error || "An unexpected error occurred." });
       }
     } catch (e) {
-      setError({ type: "generic", message: `Cannot reach the backend on port 8001. (${e.message})` });
+      setError({ type: "backend_unreachable", message: `Cannot reach the backend on port 8001. (${e.message})` });
     } finally {
       setLoading(false);
     }
@@ -464,7 +519,7 @@ export default function App() {
               Checks all environments in one click.
             </p>
 
-            {!loading && error && error.type !== "invalid_docroot" && (
+            {!loading && error && error.type !== "invalid_docroot" && error.type !== "backend_unreachable" && (
               <div className="alert-bar alert-bar-error" style={{ marginTop: 12 }}>
                 <Ico.AlertTri />{error.message}
               </div>
@@ -479,6 +534,9 @@ export default function App() {
         {!loading && error?.type === "invalid_docroot" && (
           <DocRootError customer={customer.trim()} message={error.message} />
         )}
+
+        {/* ── Backend not running ─────────────────────────────── */}
+        {!loading && error?.type === "backend_unreachable" && <BackendSetupCard />}
 
         {/* ── Results ────────────────────────────────────────── */}
         {!loading && result && (
