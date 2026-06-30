@@ -7,28 +7,18 @@ const manifest = {
   version: "2.0",
   description: "DNS Repointing Checker for Acquia hosted applications",
   key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmpYrZ6rmk7BI07BW8HCDNXb3BMSWcgYxm63uOvpL1YQXnDiA3otZjCvTLtqh0x9hdugiafx4JFBRcR1aN7q4cJU2PdA6sxip7eu3/yfUylulJvDRFKiihb5R6RrKezCjlX55/RPReukBjGcpyJ66hfX32+XEH/HOppUU+GkJQARw772SF1meNsoTJXPmEztrAfJLDy6ikggvUAjsf/K7EOfNDh6TI41YnZ/xZ7mbhHwir2diXZ51VWDlx4mncZK6MnN/Pm5gN/tBdd1/9dRVBIzIyGKMap9IXIYA7P0TGJbkANzRBFNaI1VNFP/crrzbs+bMfYC33jQAItPDtuwTcwIDAQAB",
-  action: { default_title: "Acquia DNS Finder" },
-  background: { service_worker: "background.js" },
-  permissions: ["storage", "tabs", "scripting", "webRequest"],
-  content_scripts: [
-    {
-      matches: ["https://cloud.acquia.com/*"],
-      js: ["token-interceptor.js"],
-      run_at: "document_start",
-      world: "MAIN"
-    },
-    {
-      matches: ["https://cloud.acquia.com/*"],
-      js: ["token-relay.js"],
-      run_at: "document_start"
-    }
-  ],
+  action: {
+    default_title: "Acquia DNS Finder"
+  },
+  background: {
+    service_worker: "background.js"
+  },
   host_permissions: [
-    "https://cloud.acquia.com/*",
-    "https://accounts.acquia.com/*",
-    "https://id.acquia.com/*",
-    "https://cloudflare-dns.com/*"
-  ]
+    "http://localhost:8001/*"
+  ],
+  content_security_policy: {
+    extension_pages: "script-src 'self'; object-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;"
+  }
 };
 
 const dest = path.join(__dirname, '..', 'build', 'manifest.json');

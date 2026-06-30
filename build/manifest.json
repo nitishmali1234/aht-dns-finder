@@ -10,37 +10,10 @@
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": [
-    "storage",
-    "tabs",
-    "scripting",
-    "webRequest"
-  ],
-  "content_scripts": [
-    {
-      "matches": [
-        "https://cloud.acquia.com/*"
-      ],
-      "js": [
-        "token-interceptor.js"
-      ],
-      "run_at": "document_start",
-      "world": "MAIN"
-    },
-    {
-      "matches": [
-        "https://cloud.acquia.com/*"
-      ],
-      "js": [
-        "token-relay.js"
-      ],
-      "run_at": "document_start"
-    }
-  ],
   "host_permissions": [
-    "https://cloud.acquia.com/*",
-    "https://accounts.acquia.com/*",
-    "https://id.acquia.com/*",
-    "https://cloudflare-dns.com/*"
-  ]
+    "http://localhost:8001/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;"
+  }
 }

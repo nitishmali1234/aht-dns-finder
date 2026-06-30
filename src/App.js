@@ -1,224 +1,62 @@
-/* global chrome */
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import "./App.css";
 
-/* ─── Constants ──────────────────────────────────────────────────────────── */
-const CF_DNS = "https://cloudflare-dns.com/dns-query";
+/* ─── Icons ──────────────────────────────────────────────── */
 
-/* ─── Background bridge ──────────────────────────────────────────────────── */
-function bgMsg(payload) {
-  return new Promise((resolve, reject) =>
-    chrome.runtime.sendMessage(payload, r => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve(r);
-    })
-  );
-}
-
-/* ─── Acquia Cloud API (uses cloud.acquia.com session via tab injection) ─── */
-async function acqGet(path) {
-  const resp = await bgMsg({ type: 'ACQUIA_API_CALL', endpoint: path });
-  if (!resp) throw new Error('No response from background worker.');
-  if (resp.error === 'NOT_LOGGED_IN' || resp.error === 'NO_TOKEN') throw new Error('NOT_LOGGED_IN');
-  if (resp.error) throw new Error(resp.error);
-  if (!resp.ok) {
-    let body = resp.body || '';
-    try { const j = JSON.parse(body); body = j.message || j.detail || j.error || body; } catch {}
-    throw new Error(`Acquia API (${resp.status}): ${body || 'Unknown error'}`);
-  }
-  return JSON.parse(resp.body);
-}
-
-async function findApp(name) {
-  try {
-    const d = await acqGet(`/applications?filter=hosting_id%3D${encodeURIComponent(name)}&sort=name`);
-    const items = d._embedded?.items || [];
-    if (items.length) return items[0];
-  } catch (e) {
-    if (e.message === 'NOT_LOGGED_IN') throw e;
-  }
-  const d = await acqGet('/applications?sort=name&limit=100');
-  const all = d._embedded?.items || [];
-  const match = all.find(a => {
-    const docroot = (a.hosting?.id || '').split(':').pop();
-    return docroot === name || (a.name || '').toLowerCase() === name.toLowerCase();
-  });
-  if (match) return match;
-  throw new Error(`Application "${name}" not found. Verify the docroot name.`);
-}
-
-async function getEnvs(appUuid) {
-  const d = await acqGet(`/applications/${appUuid}/environments`);
-  return d._embedded?.items || [];
-}
-
-async function getEnvDomains(envUuid) {
-  try {
-    const d = await acqGet(`/environments/${envUuid}/domains`);
-    return (d._embedded?.items || []).map(i => i.hostname || i.name || i.domain).filter(Boolean);
-  } catch { return []; }
-}
-
-/* ─── DNS-over-HTTPS (Cloudflare 1.1.1.1) ───────────────────────────────── */
-async function resolveDomain(domain) {
-  const [aData, cData] = await Promise.all([
-    fetch(`${CF_DNS}?name=${encodeURIComponent(domain)}&type=A`,     { headers: { Accept: 'application/dns-json' } }).then(r => r.json()).catch(() => null),
-    fetch(`${CF_DNS}?name=${encodeURIComponent(domain)}&type=CNAME`, { headers: { Accept: 'application/dns-json' } }).then(r => r.json()).catch(() => null),
-  ]);
-  const ips    = (aData?.Answer || []).filter(a => a.type === 1).map(a => a.data);
-  const cnames = [
-    ...(aData?.Answer || []).filter(a => a.type === 5),
-    ...(cData?.Answer || []).filter(a => a.type === 5),
-  ].map(a => a.data.replace(/\.$/, '')).filter((v, i, arr) => arr.indexOf(v) === i);
-  return { ips, cnames };
-}
-
-function dnsStatus(ips, cnames, expectedIPs) {
-  if (!ips.length && !cnames.length) return 'no_dns';
-  if (expectedIPs.length && ips.some(ip => expectedIPs.includes(ip))) return 'ok_a';
-  const all = [...ips, ...cnames].join(' ').toLowerCase();
-  if (all.includes('cloudflare') || cnames.some(c => /\.cloudflare\.net$/.test(c))) return 'cloudflare';
-  if (all.includes('akamai') || all.includes('edgekey') || all.includes('akamaiedge'))  return 'akamai';
-  if (all.includes('fastly')) return 'fastly';
-  if (cnames.some(c => c.includes('acquia-sites') || c.includes('acquia.com'))) return 'ok_cname';
-  if (cnames.length) return 'cname_other';
-  if (ips.length)    return 'not_pointing';
-  return 'no_dns';
-}
-
-/* ─── Main check ─────────────────────────────────────────────────────────── */
-const OK_STATUSES = new Set(['ok_a', 'ok_cname', 'cloudflare', 'akamai', 'fastly']);
-
-async function performCheck(appName, onStep) {
-  onStep(0);
-  const app     = await findApp(appName);
-  const envList = await getEnvs(app.uuid);
-
-  onStep(1);
-  const envDomainsList = await Promise.all(
-    envList.map(env => getEnvDomains(env.uuid || env.id))
-  );
-
-  onStep(2);
-  const tasks = [];
-  envList.forEach((env, i) => {
-    const expectedIPs = env.ips || [];
-    envDomainsList[i].forEach(domain => {
-      if (domain.endsWith('.acquia-sites.com') || domain.endsWith('.acquia.com')) return;
-      tasks.push({ env, domain, expectedIPs });
-    });
-  });
-
-  onStep(3);
-  const dnsResults = await Promise.all(
-    tasks.map(async ({ env, domain, expectedIPs }) => {
-      const { ips, cnames } = await resolveDomain(domain);
-      const status = dnsStatus(ips, cnames, expectedIPs);
-      return {
-        env:         env.name,
-        domain,
-        expected_ip: expectedIPs[0] || null,
-        actual_ip:   ips[0] || null,
-        cname:       cnames[0] || null,
-        status,
-        matches:     OK_STATUSES.has(status),
-      };
-    })
-  );
-
-  const environments = envList.map(env => {
-    const domains   = dnsResults.filter(d => d.env === env.name);
-    const repointed = domains.length === 0 || domains.every(d => OK_STATUSES.has(d.status));
-    return {
-      name:       env.name,
-      label:      env.label || env.name,
-      ips:        env.ips || [],
-      primary_ip: (env.ips || [])[0] || null,
-      type:       env.type || (env.name === 'prod' ? 'production' : 'non-production'),
-      repointed,
-      domains,
-    };
-  });
-
-  const allRepointed = environments.every(e => e.repointed);
-  const cdnDomains   = dnsResults.filter(d => ['cloudflare', 'akamai', 'fastly'].includes(d.status));
-
-  const issues   = environments.filter(e => !e.repointed && e.domains.length > 0)
-                               .map(e => `${e.label} domains have NOT been repointed`);
-  const warnings = [];
-  if (cdnDomains.length)
-    warnings.push(`${cdnDomains.length} domain(s) use a CDN — verify origin points to the correct Acquia IP`);
-  const uniqueIPs = new Set(environments.map(e => e.primary_ip).filter(Boolean));
-  if (uniqueIPs.size > 1)
-    warnings.push('Different IPs across environments — share the correct IP per environment with the customer');
-
-  return {
-    customer:     appName,
-    app_name:     app.name,
-    environments,
-    all_repointed: allRepointed,
-    total_domains: dnsResults.length,
-    issues,
-    warnings,
-    cdn_detected:  cdnDomains.length > 0,
-  };
-}
-
-/* ─── Scan steps ─────────────────────────────────────────────────────────── */
-const SCAN_STEPS = [
-  { label: 'Reading Acquia session',    cmd: 'cloud.acquia.com — Okta session token'           },
-  { label: 'Fetching application info', cmd: 'GET cloud.acquia.com/api/applications/…/environments' },
-  { label: 'Loading domain lists',      cmd: 'GET cloud.acquia.com/api/environments/…/domains' },
-  { label: 'Resolving DNS records',     cmd: 'Cloudflare DNS-over-HTTPS (1.1.1.1)'             },
-];
-
-/* ─── Icons ──────────────────────────────────────────────────────────────── */
 const Ico = {
-  Network: () => (
-    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-      <circle cx="9" cy="9" r="7.5" stroke="currentColor" strokeWidth="1.4"/>
-      <path d="M9 1.5C9 1.5 6 5 6 9s3 7.5 3 7.5M9 1.5C9 1.5 12 5 12 9s-3 7.5-3 7.5M1.5 9h15" stroke="currentColor" strokeWidth="1.4"/>
+  Dns: () => (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <rect x="1" y="2" width="14" height="4.5" rx="1.5" stroke="currentColor" strokeWidth="1.3"/>
+      <rect x="1" y="9.5" width="14" height="4.5" rx="1.5" stroke="currentColor" strokeWidth="1.3"/>
+      <circle cx="4" cy="4.25" r="0.9" fill="currentColor"/>
+      <circle cx="4" cy="11.75" r="0.9" fill="currentColor"/>
+      <path d="M7 4.25H12M7 11.75H12" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round"/>
     </svg>
   ),
   Search: () => (
     <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <circle cx="6" cy="6" r="4.5" stroke="currentColor" strokeWidth="1.5"/>
-      <path d="M10 10L13 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+      <circle cx="6" cy="6" r="4.2" stroke="currentColor" strokeWidth="1.5"/>
+      <path d="M9.5 9.5L12.5 12.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
     </svg>
   ),
   CheckCircle: () => (
-    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.5"/>
-      <path d="M7.5 12L10.5 15L16.5 9" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <circle cx="11" cy="11" r="9.5" stroke="currentColor" strokeWidth="1.5"/>
+      <path d="M7 11L9.5 13.5L15 8" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"/>
     </svg>
   ),
   XCircle: () => (
-    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.5"/>
-      <path d="M8.5 8.5L15.5 15.5M15.5 8.5L8.5 15.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <circle cx="11" cy="11" r="9.5" stroke="currentColor" strokeWidth="1.5"/>
+      <path d="M7.5 7.5L14.5 14.5M14.5 7.5L7.5 14.5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round"/>
     </svg>
   ),
   Check: () => (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-      <path d="M2 6L5 9L10 3" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"/>
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+      <path d="M2.5 6.5L5.5 9.5L10.5 3.5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"/>
     </svg>
   ),
   X: () => (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-      <path d="M2.5 2.5L9.5 9.5M9.5 2.5L2.5 9.5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round"/>
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+      <path d="M3 3L10 10M10 3L3 10" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round"/>
     </svg>
   ),
   AlertTri: () => (
-    <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-      <path d="M7.5 1.5L14 13.5H1L7.5 1.5Z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round"/>
-      <path d="M7.5 6V9" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
-      <circle cx="7.5" cy="11" r="0.75" fill="currentColor"/>
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+      <path d="M7 1.5L13 12.5H1L7 1.5Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/>
+      <path d="M7 5.5V8.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+      <circle cx="7" cy="10.5" r="0.75" fill="currentColor"/>
     </svg>
   ),
-  Settings: () => (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <circle cx="7" cy="7" r="2.5" stroke="currentColor" strokeWidth="1.3"/>
-      <path d="M7 1v1.5M7 11.5V13M1 7h1.5M11.5 7H13M2.6 2.6l1.1 1.1M10.3 10.3l1.1 1.1M2.6 11.4l1.1-1.1M10.3 3.7l1.1-1.1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+  Copy: () => (
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+      <rect x="4" y="4" width="8" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.3"/>
+      <path d="M2 9.5V2.5C2 2.22 2.22 2 2.5 2H9.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+    </svg>
+  ),
+  Chevron: () => (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+      <path d="M4 2.5L7.5 6L4 9.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
     </svg>
   ),
   List: () => (
@@ -229,40 +67,50 @@ const Ico = {
       <circle cx="2" cy="9.5" r="0.8" fill="currentColor"/>
     </svg>
   ),
-  Server: () => (
+  Terminal: () => (
     <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
-      <rect x="1" y="1.5" width="11" height="4" rx="1" stroke="currentColor" strokeWidth="1.3"/>
-      <rect x="1" y="7.5" width="11" height="4" rx="1" stroke="currentColor" strokeWidth="1.3"/>
-      <circle cx="3.5" cy="3.5" r="0.75" fill="currentColor"/>
-      <circle cx="3.5" cy="9.5" r="0.75" fill="currentColor"/>
+      <rect x="1" y="1" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.3"/>
+      <path d="M3.5 4.5L6 6.5L3.5 8.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+      <path d="M7 8.5H9.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
     </svg>
   ),
 };
 
-/* ─── ScanCard ───────────────────────────────────────────────────────────── */
+/* ─── Loading scan steps ─────────────────────────────────── */
+
+const SCAN_STEPS = [
+  { label: "Fetching application info",  cmd: "aht @{app} a:i"    },
+  { label: "Resolving balancer EIPs",    cmd: "aht server bal-…"  },
+  { label: "Running domain check",       cmd: "aht @{app} dc"     },
+  { label: "Listing domain aliases",     cmd: "aht @{app} do:li"  },
+];
+
 const ScanCard = ({ step, customer }) => (
-  <div className="card">
+  <div className="card scan-outer">
     <div className="scan-card">
       <div className="scan-header">
-        <span className="scan-tag">Scanning</span>
+        <span className="scan-label">Scanning</span>
         <span className="scan-customer">{customer}</span>
       </div>
       <div className="scan-divider" />
       <div className="scan-steps">
         {SCAN_STEPS.map((s, i) => {
-          const cls = i < step ? 'step-done' : i === step ? 'step-active' : 'step-queue';
+          const cls = i < step ? "ss-done" : i === step ? "ss-active" : "ss-pending";
+          const cmd = s.cmd.replace("{app}", customer);
           return (
             <div key={i} className={`scan-step ${cls}`}>
-              <div className="step-icon">
+              <div className="scan-step-icon">
                 {i < step  && <Ico.Check />}
-                {i === step && <span className="spin-light" />}
+                {i === step && <span className="spin" style={{ width: 10, height: 10, borderTopColor: "#93b4fd", borderColor: "rgba(147,180,253,0.2)" }} />}
               </div>
-              <div>
-                <div className="step-label">{s.label}</div>
-                <code className="step-cmd">{s.cmd}</code>
+              <div className="scan-step-text">
+                <div className="scan-step-label">{s.label}</div>
+                <code className="scan-step-cmd">{cmd}</code>
               </div>
-              <div className="step-state">
-                {i < step ? 'done' : i === step ? 'running' : 'queued'}
+              <div className="scan-step-state">
+                {i < step   ? "done"    : ""}
+                {i === step ? "running" : ""}
+                {i > step   ? "queued"  : ""}
               </div>
             </div>
           );
@@ -272,52 +120,80 @@ const ScanCard = ({ step, customer }) => (
   </div>
 );
 
-/* ─── StatusPill ─────────────────────────────────────────────────────────── */
+/* ─── Invalid docroot error ──────────────────────────────── */
+
+const DocRootError = ({ customer, message }) => (
+  <div className="card">
+    <div className="docroot-error">
+      <div className="err-icon-ring">
+        <Ico.XCircle />
+      </div>
+      <div className="err-title">Application Not Found</div>
+      <div className="err-docroot">"{customer}"</div>
+      <div className="err-msg">
+        {message || "No Acquia application found for this name."}
+      </div>
+      <div className="err-hint">
+        Verify the docroot name in CCI → Hosted Domains
+      </div>
+    </div>
+  </div>
+);
+
+/* ─── Status pill ────────────────────────────────────────── */
+
 const StatusPill = ({ status }) => {
   const MAP = {
-    ok_a:        { label: 'OK · A record',  cls: 'sp-ok'      },
-    ok_cname:    { label: 'OK · CNAME',     cls: 'sp-ok'      },
-    cloudflare:  { label: 'Cloudflare CDN', cls: 'sp-warn'    },
-    akamai:      { label: 'Akamai CDN',     cls: 'sp-warn'    },
-    fastly:      { label: 'Fastly CDN',     cls: 'sp-warn'    },
-    not_pointing:{ label: 'Not pointing',   cls: 'sp-error'   },
-    cname_other: { label: 'CNAME (other)',  cls: 'sp-neutral' },
-    no_dns:      { label: 'No DNS entry',   cls: 'sp-neutral' },
+    ok_a:          { label: "OK · A record",        cls: "sp-ok",      dot: "d-ok"      },
+    ok_cname:      { label: "OK · CNAME",            cls: "sp-ok",      dot: "d-ok"      },
+    cloudflare:    { label: "Cloudflare CDN",         cls: "sp-warn",    dot: "d-warn"    },
+    cloudflare_ns: { label: "CF Authoritative",       cls: "sp-warn",    dot: "d-warn"    },
+    akamai:        { label: "Akamai CDN",             cls: "sp-warn",    dot: "d-warn"    },
+    not_pointing:  { label: "Not pointing",           cls: "sp-error",   dot: "d-error"   },
+    missing_edge:  { label: "Missing edge cluster",   cls: "sp-error",   dot: "d-error"   },
+    bypassing:     { label: "Bypassing edge",         cls: "sp-warn",    dot: "d-warn"    },
+    no_dns:        { label: "No DNS entry",           cls: "sp-neutral", dot: "d-neutral" },
   };
-  const c = MAP[status] ?? { label: status, cls: 'sp-neutral' };
-  const dotCls = { 'sp-ok':'d-ok','sp-error':'d-error','sp-warn':'d-warn','sp-neutral':'d-neutral' }[c.cls];
+  const c = MAP[status] ?? { label: status, cls: "sp-neutral", dot: "d-neutral" };
   return (
     <span className={`spill ${c.cls}`}>
-      <span className={`dot ${dotCls}`} />{c.label}
+      <span className={`dot ${c.dot}`} />
+      {c.label}
     </span>
   );
 };
 
-/* ─── EnvBadge ───────────────────────────────────────────────────────────── */
+/* ─── Env badge ──────────────────────────────────────────── */
+
 const EnvBadge = ({ env }) => {
-  const cls = { prod:'eb-prod', dev:'eb-dev', test:'eb-test', stage:'eb-stage', dev2:'eb-dev' }[env] ?? 'eb-other';
+  const cls = { prod: "eb-prod", dev: "eb-dev", test: "eb-test", stage: "eb-stage" }[env] ?? "eb-other";
   return <span className={`ebadge ${cls}`}>{env}</span>;
 };
 
-/* ─── DomainTable ────────────────────────────────────────────────────────── */
+/* ─── Domain table ───────────────────────────────────────── */
+
 const DomainTable = ({ domains }) => (
   <div className="table-wrap">
     <table className="domain-table">
       <thead>
         <tr>
-          <th>Domain</th><th>Status</th>
-          <th>Expected IP</th><th>Actual IP</th><th>CNAME</th><th>Match</th>
+          <th>Domain</th>
+          <th>Env</th>
+          <th>Status</th>
+          <th>Expected IP</th>
+          <th>Actual IP</th>
+          <th>Match</th>
         </tr>
       </thead>
       <tbody>
         {domains.map((d, i) => (
           <tr key={i}>
             <td className="td-domain">{d.domain}</td>
+            <td><EnvBadge env={d.env} /></td>
             <td><StatusPill status={d.status} /></td>
-            <td className="td-ip">{d.expected_ip || '—'}</td>
-            <td className={`td-ip ${d.matches ? 'td-ip-ok' : 'td-ip-fail'}`}>{d.actual_ip || '—'}</td>
-            <td className="td-ip" style={{ fontSize:'0.68rem', maxWidth:200, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
-              {d.cname || '—'}
+            <td className="td-ip">{d.expected_ip || "—"}</td>
+            <td className={`td-ip ${d.matches ? "td-ip-ok" : "td-ip-fail"}`}>
+              {d.actual_ip || "—"}
             </td>
             <td>
               {d.matches
@@ -331,45 +207,61 @@ const DomainTable = ({ domains }) => (
   </div>
 );
 
-/* ─── StatusCard ─────────────────────────────────────────────────────────── */
+/* ─── Status summary ─────────────────────────────────────── */
+
 const StatusCard = ({ result }) => {
-  const ok = result.all_repointed;
+  const { summary, customer } = result;
+  const ok = summary.all_repointed;
+  const needAction = result.domains.filter(d => !d.matches).length;
+
+  const envRows = [
+    { key: "prod",    label: "Production",    ok: summary.prod_repointed,     n: summary.prod_domains_count     },
+    { key: "nonprod", label: "Non-production", ok: summary.non_prod_repointed, n: summary.non_prod_domains_count },
+  ].filter(e => e.n > 0);
+
   return (
     <div className="card">
       <div className="status-banner">
         <div className="status-left">
-          <div className={`status-glyph ${ok ? 'sg-ok' : 'sg-error'}`}>
+          <div className={`status-glyph ${ok ? "sg-ok" : "sg-error"}`}>
+            <div className="status-glyph-pulse" />
             {ok ? <Ico.CheckCircle /> : <Ico.XCircle />}
           </div>
-          <div>
+          <div className="status-info">
             <div className="status-verdict">
-              {ok ? 'DNS Repointing Complete' : 'DNS Repointing Incomplete'}
+              {ok ? "DNS Repointing Complete" : "DNS Repointing Incomplete"}
             </div>
             <div className="status-meta">
-              Customer: <code>{result.customer}</code>
-              {result.app_name && result.app_name !== result.customer && <> · {result.app_name}</>}
+              Customer: <code>{customer}</code>
               &ensp;·&ensp;
-              {result.total_domains} domain(s) across {result.environments.length} environment(s)
-              {result.cdn_detected && <>&ensp;·&ensp;CDN detected</>}
+              {ok
+                ? `All ${summary.total_domains} domain(s) verified`
+                : `${needAction} of ${summary.total_domains} domain(s) require action`}
+              {summary.cdn_detected && <>&ensp;·&ensp;CDN detected</>}
             </div>
           </div>
         </div>
-        <div className="status-chips">
-          {result.environments.map(env => (
-            <div key={env.name} className={`status-chip ${env.repointed ? 'chip-ok' : 'chip-error'}`}>
-              <span className={`dot ${env.repointed ? 'd-ok' : 'd-error'}`} />
-              {env.name} · <strong>{env.domains.length}</strong>
+        <div className="status-env-chips">
+          {envRows.map(e => (
+            <div key={e.key} className={`env-chip ${e.ok ? "ec-ok" : "ec-error"}`}>
+              <span className={`dot ${e.ok ? "d-ok" : "d-error"}`} />
+              {e.label} · <strong>{e.n}</strong>
             </div>
           ))}
         </div>
       </div>
-      {(result.issues.length > 0 || result.warnings.length > 0) && (
+
+      {(summary.issues.length > 0 || summary.warnings.length > 0) && (
         <div className="issues-list">
-          {result.issues.map((m, i) => (
-            <div key={i} className="alert alert-error"><Ico.AlertTri />{m}</div>
+          {summary.issues.map((m, i) => (
+            <div key={i} className="alert-bar alert-bar-error">
+              <Ico.XCircle />{m.replace(/^[❌⚠️]\s*/, "")}
+            </div>
           ))}
-          {result.warnings.map((m, i) => (
-            <div key={i} className="alert alert-warning"><Ico.AlertTri />{m}</div>
+          {summary.warnings.map((m, i) => (
+            <div key={i} className="alert-bar alert-bar-warning">
+              <Ico.AlertTri />{m.replace(/^[❌⚠️]\s*/, "")}
+            </div>
           ))}
         </div>
       )}
@@ -377,25 +269,27 @@ const StatusCard = ({ result }) => {
   );
 };
 
-/* ─── EnvGrid ────────────────────────────────────────────────────────────── */
-const EnvGrid = ({ environments }) => (
+/* ─── Environment grid ───────────────────────────────────── */
+
+const EnvGrid = ({ environments, summary }) => (
   <div className="card">
     <div className="card-head">
-      <span className="card-head-label"><Ico.Server /> Environments</span>
+      <span className="card-head-label"><Ico.Dns /> Environments</span>
     </div>
     <div className="env-grid">
-      {environments.map(env => {
-        const typeTag = env.type === 'production' ? 'tag-dedicated' : 'tag-shared';
+      {Object.entries(environments).map(([name, data]) => {
+        const ok = name === "prod" ? summary.prod_repointed : summary.non_prod_repointed;
+        const typeTag = data.type === "dedicated" ? "tt-dedicated" : data.type === "shared" ? "tt-shared" : "tt-unknown";
         return (
-          <div key={env.name} className={`env-card ${env.repointed ? 'env-card-ok' : 'env-card-error'}`}>
-            <div className="env-card-name">{env.name}</div>
+          <div key={name} className={`env-card ${ok ? "ec-left-ok" : "ec-left-error"}`}>
+            <div className="env-card-name">{name}</div>
             <div className="env-card-status">
-              <span className={`dot ${env.repointed ? 'd-ok' : 'd-error'}`} />
-              {env.repointed ? 'Repointed' : 'Not repointed'}
+              <span className={`dot ${ok ? "d-ok" : "d-error"}`} />
+              {ok ? "Repointed" : "Not repointed"}
             </div>
-            <div className="env-card-eip">{env.primary_ip || '—'}</div>
-            <div className="env-card-bal">{env.label}</div>
-            <span className={`type-tag ${typeTag}`}>{env.type || 'unknown'}</span>
+            <div className="env-card-eip">{data.eip || "—"}</div>
+            <div className="env-card-bal">{data.primary_balancer || "—"}</div>
+            <span className={`type-tag ${typeTag}`}>{data.type || "unknown"}</span>
           </div>
         );
       })}
@@ -403,56 +297,136 @@ const EnvGrid = ({ environments }) => (
   </div>
 );
 
-/* ─── App ────────────────────────────────────────────────────────────────── */
+/* ─── Slack template ─────────────────────────────────────── */
+
+const SlackCard = ({ result }) => {
+  const [copied, setCopied] = useState(false);
+  const { summary, eips, customer } = result;
+
+  const text = (() => {
+    let r = summary.all_repointed
+      ? `✅ *DNS Repointing Status: COMPLETE*\n\nCustomer *${customer}* has repointed DNS to the new dedicated balancers.\n\n`
+      : `❌ *DNS Repointing Status: INCOMPLETE*\n\nCustomer *${customer}* has NOT repointed DNS yet.\n\n`;
+
+    r += "*EIP Information:*\n";
+    const pe = eips.prod, npe = eips.dev || eips.test || eips.stage;
+    if (pe)  r += `• Production EIP: \`${pe}\`\n`;
+    if (npe && npe !== pe) {
+      r += `• Non-Production EIP: \`${npe}\`\n`;
+      r += "\n⚠️ *Note:* Different EIPs for prod and non-prod — share both with the customer.\n";
+    } else if (npe) {
+      r += `• Non-Production EIP: \`${npe}\`\n`;
+    }
+    r += "\n";
+
+    if (summary.issues.length)   { r += "*Issues:*\n";   summary.issues.forEach(m => { r += `${m}\n`; }); r += "\n"; }
+    if (summary.warnings.length) { r += "*Warnings:*\n"; summary.warnings.forEach(m => { r += `${m}\n`; }); r += "\n"; }
+
+    r += "*Domain Summary:*\n";
+    r += `• Total: ${summary.total_domains} domain(s)\n`;
+    r += `• Production: ${summary.prod_domains_count} — ${summary.prod_repointed ? "✅ OK" : "❌ Needs repointing"}\n`;
+    r += `• Non-Production: ${summary.non_prod_domains_count} — ${summary.non_prod_repointed ? "✅ OK" : "❌ Needs repointing"}\n`;
+    if (!summary.all_repointed)
+      r += "\n*Next Steps:* Customer must update DNS before old shared balancers can be decommissioned.\n";
+    if (summary.cdn_detected)
+      r += "\n⚠️ *CDN Detected:* Some domains use Cloudflare/Akamai — customer may need to update CDN origin instead.\n";
+    return r;
+  })();
+
+  const copy = () => {
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="card">
+      <div className="card-head">
+        <span className="card-head-label">Slack Response Template</span>
+        <button className="btn-ghost" onClick={copy}>
+          {copied ? <><Ico.Check /> Copied</> : <><Ico.Copy /> Copy</>}
+        </button>
+      </div>
+      <div className="card-body">
+        <pre className="slack-pre">{text}</pre>
+      </div>
+    </div>
+  );
+};
+
+/* ─── Collapsible ────────────────────────────────────────── */
+
+const Coll = ({ icon, label, children }) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button className="coll-trigger" onClick={() => setOpen(o => !o)}>
+        {icon}{label}
+        <span className={`coll-chevron ${open ? "open" : ""}`}><Ico.Chevron /></span>
+      </button>
+      {open && <div className="coll-body">{children}</div>}
+    </>
+  );
+};
+
+/* ─── App ────────────────────────────────────────────────── */
+
 export default function App() {
-  const [customer,  setCustomer]  = useState('');
-  const [loading,   setLoading]   = useState(false);
-  const [scanStep,  setScanStep]  = useState(0);
-  const [result,    setResult]    = useState(null);
-  const [error,     setError]     = useState(null);
-  const inputRef = useRef(null);
+  const [customer, setCustomer] = useState("");
+  const [loading,  setLoading]  = useState(false);
+  const [scanStep, setScanStep] = useState(0);
+  const [result,   setResult]   = useState(null);
+  const [error,    setError]    = useState(null); // { type, message }
 
-  useEffect(() => { inputRef.current?.focus(); }, []);
-
-  /* ── Scan step timing ── */
   useEffect(() => {
     if (!loading) { setScanStep(0); return; }
     const t = [
-      setTimeout(() => setScanStep(1), 1200),
-      setTimeout(() => setScanStep(2), 3500),
-      setTimeout(() => setScanStep(3), 6000),
+      setTimeout(() => setScanStep(1), 1800),
+      setTimeout(() => setScanStep(2), 3600),
+      setTimeout(() => setScanStep(3), 5300),
     ];
     return () => t.forEach(clearTimeout);
   }, [loading]);
 
   const runCheck = async () => {
     const name = customer.trim();
-    if (!name) { setError('Enter an application name.'); return; }
+    if (!name) { setError({ type: "validation", message: "Enter an application name first." }); return; }
+
     setLoading(true); setError(null); setResult(null);
+
     try {
-      const data = await performCheck(name, setScanStep);
-      setResult(data);
-    } catch (e) {
-      if (e.message === 'NOT_LOGGED_IN') {
-        setError('Not signed in to Acquia Cloud. Sign in at cloud.acquia.com and try again.');
+      const res  = await fetch(`http://localhost:8001/full-check?username=${encodeURIComponent(name)}`);
+      const data = await res.json();
+
+      if (data.success) {
+        setResult(data);
+      } else if (data.error_type === "invalid_docroot") {
+        setError({ type: "invalid_docroot", message: data.error });
       } else {
-        setError(e.message);
+        setError({ type: "generic", message: data.error || "An unexpected error occurred." });
       }
+    } catch (e) {
+      setError({ type: "generic", message: `Cannot reach the backend on port 8001. (${e.message})` });
     } finally {
       setLoading(false);
     }
   };
 
+  const prod    = result?.domains.filter(d => d.env === "prod")  ?? [];
+  const nonprod = result?.domains.filter(d => d.env !== "prod")  ?? [];
+
   return (
     <div className="page">
 
-      {/* ── Topbar ──────────────────────────────────────────────────────── */}
+      {/* ── Topbar ─────────────────────────────────────────── */}
       <header className="topbar">
         <div className="topbar-inner">
-          <div className="topbar-icon"><Ico.Network /></div>
+          <div className="topbar-logo"><Ico.Dns /></div>
           <span className="topbar-title">Acquia DNS Finder</span>
+          <div className="topbar-sep" />
+          <span className="topbar-sub">T1 Repointing Checker</span>
           <div className="topbar-right">
-            <div className="live-badge"><span className="live-dot" />Live</div>
+            <div className="topbar-live"><span className="live-dot" />Live</div>
             <span className="topbar-tag">Internal</span>
           </div>
         </div>
@@ -460,78 +434,116 @@ export default function App() {
 
       <main className="main">
 
-        {/* ── Search ──────────────────────────────────────────────────── */}
+        {/* ── Query ──────────────────────────────────────────── */}
         <div className="card">
-          <div className="search-section">
-            <div className="search-label">Application / Docroot Name</div>
-            <div className="search-row">
-              <div className="search-input-wrap">
-                <span className="search-prefix">&gt;</span>
+          <div className="query-section">
+            <div className="query-label">Application / Docroot Name</div>
+            <div className="query-row">
+              <div className="query-input-wrap">
+                <span className="query-prefix">&gt;</span>
                 <input
-                  ref={inputRef}
-                  className="search-input"
+                  className="query-input"
                   type="text"
                   value={customer}
                   onChange={e => { setCustomer(e.target.value); setError(null); setResult(null); }}
-                  onKeyDown={e => e.key === 'Enter' && !loading && runCheck()}
+                  onKeyDown={e => e.key === "Enter" && !loading && runCheck()}
                   placeholder="iqstudent"
                   disabled={loading}
+                  autoFocus
                 />
               </div>
-              <button className="btn-primary" onClick={runCheck} disabled={loading}>
-                {loading ? <><span className="spin" />Running…</> : <><Ico.Search />Run Check</>}
+              <button className="btn-run" onClick={runCheck} disabled={loading}>
+                {loading
+                  ? <><span className="spin" /> Running…</>
+                  : <><Ico.Search /> Run Check</>}
               </button>
             </div>
-            <p className="search-hint">
-              Application name only — no "@" prefix, no ".prod" suffix. E.g. <code>iqstudent</code>
+            <p className="query-hint">
+              Application name only — no "@" or environment suffix.
+              E.g. <code>iqstudent</code> not <code>iqstudent.prod</code>.
+              Checks all environments in one click.
             </p>
-            {!loading && error && (
-              <div className="alert alert-error" style={{ marginTop: 14 }}>
-                <Ico.AlertTri />{error}
+
+            {!loading && error && error.type !== "invalid_docroot" && (
+              <div className="alert-bar alert-bar-error" style={{ marginTop: 12 }}>
+                <Ico.AlertTri />{error.message}
               </div>
             )}
           </div>
         </div>
 
-        {/* ── Scan animation ──────────────────────────────────────────── */}
+        {/* ── Scanning ───────────────────────────────────────── */}
         {loading && <ScanCard step={scanStep} customer={customer.trim()} />}
 
-        {/* ── Results ─────────────────────────────────────────────────── */}
+        {/* ── Invalid docroot ─────────────────────────────────── */}
+        {!loading && error?.type === "invalid_docroot" && (
+          <DocRootError customer={customer.trim()} message={error.message} />
+        )}
+
+        {/* ── Results ────────────────────────────────────────── */}
         {!loading && result && (
           <>
             <StatusCard result={result} />
-            <EnvGrid environments={result.environments} />
+
+            <EnvGrid environments={result.environments} summary={result.summary} />
+
+            {/* Domain check */}
             <div className="card">
               <div className="card-head">
                 <span className="card-head-label">
-                  <Ico.List />Domain Check
-                  <span className="count-badge">{result.total_domains}</span>
+                  <Ico.List /> Domain Check
+                  <span className="count-pill">{result.domains.length}</span>
                 </span>
-                <span className="card-head-meta">Cloudflare DNS-over-HTTPS</span>
+                <span className="card-head-meta">aht @{result.customer} dc</span>
               </div>
-              {result.environments.map(env => {
-                if (env.domains.length === 0) return null;
-                return (
-                  <div key={env.name}>
-                    <div className="domain-section-label">
-                      <span className={`dot ${env.repointed ? 'd-ok' : 'd-error'}`} />
-                      <EnvBadge env={env.name} />
-                      <span style={{ color:'var(--t2)' }}>{env.domains.length} domain(s)</span>
-                      {env.primary_ip && (
-                        <code style={{ fontFamily:'var(--mono)', fontSize:'0.68rem', color:'var(--t3)' }}>
-                          → {env.primary_ip}
-                        </code>
-                      )}
-                    </div>
-                    <DomainTable domains={env.domains} />
+
+              {prod.length > 0 && (
+                <>
+                  <div className="domain-section-label">
+                    <span className="dot d-neutral" />Production
                   </div>
-                );
-              })}
-              {result.environments.every(e => e.domains.length === 0) && (
-                <div className="card-body" style={{ color:'var(--t2)', fontSize:'0.82rem' }}>
-                  No customer domains found for this application.
+                  <DomainTable domains={prod} />
+                </>
+              )}
+              {nonprod.length > 0 && (
+                <>
+                  <div className="domain-section-label">
+                    <span className="dot d-neutral" />Non-production
+                  </div>
+                  <DomainTable domains={nonprod} />
+                </>
+              )}
+              {result.domains.length === 0 && (
+                <div className="card-body" style={{ color: "var(--t2)", fontSize: "0.82rem" }}>
+                  No domains found — the application has no configured hosted domains.
                 </div>
               )}
+
+              {result.domain_list?.length > 0 && (
+                <Coll icon={<Ico.List />} label={`Domain aliases (do:li) · ${result.domain_list.length} found`}>
+                  <div className="domain-list-grid">
+                    {result.domain_list.map((d, i) => (
+                      <div key={i} className="domain-list-item">{d.domain}</div>
+                    ))}
+                  </div>
+                </Coll>
+              )}
+            </div>
+
+            <SlackCard result={result} />
+
+            {/* Raw output */}
+            <div className="card">
+              <Coll icon={<Ico.Terminal />} label="Raw Command Output">
+                <div className="code-label">Command: <code>aht @{result.customer} a:i</code></div>
+                <pre className="code-block">{result.raw_outputs.app_info}</pre>
+                <div className="code-label">Command: <code>aht @{result.customer} dc</code></div>
+                <pre className="code-block">{result.raw_outputs.dc}</pre>
+                {result.raw_outputs.domain_list && <>
+                  <div className="code-label">Command: <code>aht @{result.customer} do:li</code></div>
+                  <pre className="code-block">{result.raw_outputs.domain_list}</pre>
+                </>}
+              </Coll>
             </div>
           </>
         )}
