@@ -11,11 +11,6 @@
 # production
 # /build is intentionally committed so teammates don't need Node.js
 
-# python
-venv/
-__pycache__/
-*.pyc
-
 # misc
 .DS_Store
 .env.local

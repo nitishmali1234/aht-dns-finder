@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import "./App.css";
+import { runFullCheck, AcquiaApiError } from "./acquiaApi";
 
 /* ─── Icons ──────────────────────────────────────────────── */
 
@@ -48,6 +49,12 @@ const Ico = {
       <circle cx="7" cy="10.5" r="0.75" fill="currentColor"/>
     </svg>
   ),
+  Gear: () => (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+      <circle cx="8" cy="8" r="2.3" stroke="currentColor" strokeWidth="1.3"/>
+      <path d="M8 1.5V3M8 13V14.5M14.5 8H13M3 8H1.5M12.4 3.6L11.3 4.7M4.7 11.3L3.6 12.4M12.4 12.4L11.3 11.3M4.7 4.7L3.6 3.6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+    </svg>
+  ),
   Copy: () => (
     <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
       <rect x="4" y="4" width="8" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.3"/>
@@ -79,10 +86,10 @@ const Ico = {
 /* ─── Loading scan steps ─────────────────────────────────── */
 
 const SCAN_STEPS = [
-  { label: "Fetching application info",  cmd: "aht @{app} a:i"    },
-  { label: "Resolving balancer EIPs",    cmd: "aht server bal-…"  },
-  { label: "Running domain check",       cmd: "aht @{app} dc"     },
-  { label: "Listing domain aliases",     cmd: "aht @{app} do:li"  },
+  { label: "Looking up application",      cmd: "GET /applications?filter=…"            },
+  { label: "Fetching environments & EIPs", cmd: "GET /applications/{uuid}/environments" },
+  { label: "Checking domain DNS status",  cmd: "GET /environments/{id}/domains/{d}/status" },
+  { label: "Compiling results",           cmd: "—"                                      },
 ];
 
 const ScanCard = ({ step, customer }) => (
@@ -140,55 +147,82 @@ const DocRootError = ({ customer, message }) => (
   </div>
 );
 
-/* ─── Backend not running — one-time setup ───────────────── */
+/* ─── Settings — Acquia API Key/Secret entry ─────────────── */
 
-const BackendSetupCard = () => {
-  const [downloaded, setDownloaded] = useState(false);
+const SettingsCard = ({ onSaved, embedded }) => {
+  const [apiKey, setApiKey] = useState("");
+  const [apiSecret, setApiSecret] = useState("");
+  const [saved, setSaved] = useState(false);
 
-  const downloadSetup = () => {
-    const url = chrome.runtime.getURL("AcquiaDNSFinderSetup.pkg");
-    if (window.chrome?.downloads) {
-      chrome.downloads.download({ url, filename: "AcquiaDNSFinderSetup.pkg", saveAs: false });
-    } else {
-      window.open(url, "_blank");
-    }
-    setDownloaded(true);
+  useEffect(() => {
+    chrome.storage.local.get(["apiKey", "apiSecret"]).then((v) => {
+      if (v.apiKey) setApiKey(v.apiKey);
+      if (v.apiSecret) setApiSecret(v.apiSecret);
+    });
+  }, []);
+
+  const save = async () => {
+    await chrome.storage.local.set({ apiKey: apiKey.trim(), apiSecret: apiSecret.trim() });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+    onSaved?.();
   };
 
   return (
-    <div className="card">
+    <div className={embedded ? "" : "card"}>
       <div className="docroot-error">
-        <div className="err-icon-ring">
-          <Ico.AlertTri />
-        </div>
-        <div className="err-title">Backend Not Running</div>
-        <div className="err-msg">
-          This extension needs a small local helper running on your Mac to
-          drive the <code>aht</code> CLI. It looks like it isn't set up on
-          this machine yet — that's a one-time, no-terminal step.
-        </div>
+        {!embedded && (
+          <>
+            <div className="err-icon-ring">
+              <Ico.AlertTri />
+            </div>
+            <div className="err-title">Connect Your Acquia Account</div>
+            <div className="err-msg">
+              This extension talks directly to the Acquia Cloud Platform API —
+              there's no local backend to install. Paste your API Key and
+              Secret below (one-time, stored only in this browser).
+            </div>
+          </>
+        )}
 
-        <button className="btn-run" onClick={downloadSetup} style={{ margin: "4px auto 18px" }}>
-          <Ico.Search /> {downloaded ? "Download Again" : "Download Setup"}
-        </button>
-
-        <div className="setup-steps">
+        <div className="setup-steps" style={{ textAlign: "left" }}>
           <div className="setup-step">
             <span className="setup-step-n">1</span>
-            Click the button above — saves <code>AcquiaDNSFinderSetup.pkg</code> to your Downloads
+            Go to <strong>cloud.acquia.com</strong> → your avatar → <strong>Account Settings → API Tokens</strong>
           </div>
           <div className="setup-step">
             <span className="setup-step-n">2</span>
-            Open it from Downloads and click through the installer (just like installing any Mac app)
-          </div>
-          <div className="setup-step">
-            <span className="setup-step-n">3</span>
-            Come back here and click <strong>Run Check</strong> again
+            Click <strong>Create Token</strong>, then copy the Key and Secret shown
           </div>
         </div>
 
-        <div className="err-hint" style={{ marginTop: 14 }}>
-          Requires <code>aht</code> and <code>php</code> already installed and on your PATH
+        <input
+          className="search-input"
+          style={{ width: "100%", marginTop: 14 }}
+          placeholder="API Key"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+        />
+        <input
+          className="search-input"
+          style={{ width: "100%", marginTop: 8 }}
+          placeholder="API Secret"
+          type="password"
+          value={apiSecret}
+          onChange={(e) => setApiSecret(e.target.value)}
+        />
+
+        <button
+          className="btn-run"
+          onClick={save}
+          disabled={!apiKey.trim() || !apiSecret.trim()}
+          style={{ margin: "14px auto 4px" }}
+        >
+          <Ico.Search /> {saved ? "Saved" : "Save Credentials"}
+        </button>
+
+        <div className="err-hint" style={{ marginTop: 10 }}>
+          Stored locally via <code>chrome.storage</code> — never leaves this browser except to authenticate directly with Acquia.
         </div>
       </div>
     </div>
@@ -432,26 +466,23 @@ export default function App() {
   const [scanStep, setScanStep] = useState(0);
   const [result,   setResult]   = useState(null);
   const [error,    setError]    = useState(null); // { type, message }
+  const [hasCreds, setHasCreds] = useState(null); // null = unknown yet, bool once checked
+  const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
-    if (!loading) { setScanStep(0); return; }
-    const t = [
-      setTimeout(() => setScanStep(1), 1800),
-      setTimeout(() => setScanStep(2), 3600),
-      setTimeout(() => setScanStep(3), 5300),
-    ];
-    return () => t.forEach(clearTimeout);
-  }, [loading]);
+    chrome.storage.local.get(["apiKey", "apiSecret"]).then((v) => {
+      setHasCreds(!!(v.apiKey && v.apiSecret));
+    });
+  }, []);
 
   const runCheck = async () => {
     const name = customer.trim();
     if (!name) { setError({ type: "validation", message: "Enter an application name first." }); return; }
 
-    setLoading(true); setError(null); setResult(null);
+    setLoading(true); setError(null); setResult(null); setScanStep(0);
 
     try {
-      const res  = await fetch(`http://localhost:8001/full-check?username=${encodeURIComponent(name)}`);
-      const data = await res.json();
+      const data = await runFullCheck(name, setScanStep);
 
       if (data.success) {
         setResult(data);
@@ -461,7 +492,14 @@ export default function App() {
         setError({ type: "generic", message: data.error || "An unexpected error occurred." });
       }
     } catch (e) {
-      setError({ type: "backend_unreachable", message: `Cannot reach the backend on port 8001. (${e.message})` });
+      if (e instanceof AcquiaApiError && e.status === "NO_CREDENTIALS") {
+        setHasCreds(false);
+        setError({ type: "no_credentials", message: e.message });
+      } else if (e instanceof AcquiaApiError && e.status === "BAD_CREDENTIALS") {
+        setError({ type: "bad_credentials", message: e.message });
+      } else {
+        setError({ type: "network", message: e.message || "An unexpected error occurred." });
+      }
     } finally {
       setLoading(false);
     }
@@ -483,11 +521,33 @@ export default function App() {
           <div className="topbar-right">
             <div className="topbar-live"><span className="live-dot" />Live</div>
             <span className="topbar-tag">Internal</span>
+            <button
+              className="btn-run"
+              style={{ padding: "6px 10px", marginLeft: 10 }}
+              onClick={() => setShowSettings(s => !s)}
+              title="Acquia API credentials"
+            >
+              <Ico.Gear />
+            </button>
           </div>
         </div>
       </header>
 
       <main className="main">
+
+        {/* ── Settings ───────────────────────────────────────── */}
+        {showSettings && (
+          <div className="card">
+            <SettingsCard
+              embedded
+              onSaved={() => {
+                setHasCreds(true);
+                setShowSettings(false);
+                if (error?.type === "no_credentials" || error?.type === "bad_credentials") setError(null);
+              }}
+            />
+          </div>
+        )}
 
         {/* ── Query ──────────────────────────────────────────── */}
         <div className="card">
@@ -519,7 +579,7 @@ export default function App() {
               Checks all environments in one click.
             </p>
 
-            {!loading && error && error.type !== "invalid_docroot" && error.type !== "backend_unreachable" && (
+            {!loading && error && !["invalid_docroot", "no_credentials", "bad_credentials"].includes(error.type) && (
               <div className="alert-bar alert-bar-error" style={{ marginTop: 12 }}>
                 <Ico.AlertTri />{error.message}
               </div>
@@ -535,8 +595,10 @@ export default function App() {
           <DocRootError customer={customer.trim()} message={error.message} />
         )}
 
-        {/* ── Backend not running ─────────────────────────────── */}
-        {!loading && error?.type === "backend_unreachable" && <BackendSetupCard />}
+        {/* ── No / bad credentials ────────────────────────────── */}
+        {!loading && (error?.type === "no_credentials" || error?.type === "bad_credentials" || hasCreds === false) && !showSettings && (
+          <SettingsCard onSaved={() => { setHasCreds(true); setError(null); }} />
+        )}
 
         {/* ── Results ────────────────────────────────────────── */}
         {!loading && result && (
@@ -578,7 +640,7 @@ export default function App() {
               )}
 
               {result.domain_list?.length > 0 && (
-                <Coll icon={<Ico.List />} label={`Domain aliases (do:li) · ${result.domain_list.length} found`}>
+                <Coll icon={<Ico.List />} label={`All domain aliases · ${result.domain_list.length} found`}>
                   <div className="domain-list-grid">
                     {result.domain_list.map((d, i) => (
                       <div key={i} className="domain-list-item">{d.domain}</div>
@@ -592,15 +654,11 @@ export default function App() {
 
             {/* Raw output */}
             <div className="card">
-              <Coll icon={<Ico.Terminal />} label="Raw Command Output">
-                <div className="code-label">Command: <code>aht @{result.customer} a:i</code></div>
-                <pre className="code-block">{result.raw_outputs.app_info}</pre>
-                <div className="code-label">Command: <code>aht @{result.customer} dc</code></div>
-                <pre className="code-block">{result.raw_outputs.dc}</pre>
-                {result.raw_outputs.domain_list && <>
-                  <div className="code-label">Command: <code>aht @{result.customer} do:li</code></div>
-                  <pre className="code-block">{result.raw_outputs.domain_list}</pre>
-                </>}
+              <Coll icon={<Ico.Terminal />} label="Raw Acquia API Data">
+                <div className="code-label">
+                  Application: <code>{result.application?.name}</code> ({result.application?.hosting_id})
+                </div>
+                <pre className="code-block">{JSON.stringify(result, null, 2)}</pre>
               </Coll>
             </div>
           </>

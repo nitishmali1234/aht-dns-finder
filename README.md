@@ -2,16 +2,14 @@
 
 A Chrome Extension for T1 Support Engineers to check DNS repointing status
 for Acquia hosted applications. Opens in a full browser tab and runs a
-DNS repointing check (`a:i`, `dc`, `do:li`) against a single application
-in one click.
+DNS repointing check against a single application in one click.
 
-**No Acquia Cloud UI login, no API tokens, no manual "start the server"
-step.** The extension talks to a tiny local backend that drives the
-`aht` CLI directly — the same auth you already have configured for `aht`
-on your machine. The backend runs as a background service that starts
-itself at login and restarts itself if it ever dies. Even the one-time
-backend setup happens from inside the extension itself — no terminal,
-ever.
+**No local backend, no CLI, no install script, nothing to run in a
+terminal.** The extension calls the official **Acquia Cloud Platform
+API** directly from the browser. The only one-time step is pasting your
+own Acquia API Key/Secret into the extension's Settings panel — the same
+kind of thing you'd do for any extension that needs to authenticate
+(GitHub, Slack, etc.).
 
 ---
 
@@ -19,56 +17,38 @@ ever.
 
 | Requirement | Notes |
 |---|---|
-| Google Chrome | Any recent version, macOS |
-| `aht` CLI | Installed and authenticated, on your `PATH` |
-| `php` | Required by `aht`, on your `PATH` |
+| Google Chrome | Any recent version |
+| Acquia Cloud API Key/Secret | Generated once from Acquia Cloud UI (see below) |
 
-`python3` (preinstalled on macOS) is used once, automatically, to create
-the backend's virtualenv — you don't run it yourself.
+That's it — no `aht`, no `php`, no Python, no local server.
 
 ---
 
 ## Installation (one time)
 
-### Step 1 — Load the extension in Chrome
+### Step 1 — Load the extension
 
-1. Clone or download this repo
+1. Clone this repo
 2. Open Chrome → go to **`chrome://extensions`**
 3. Toggle **Developer mode** ON (top-right corner)
 4. Click **Load unpacked**
 5. Select the **`build`** folder inside this repo
 6. Click the extension icon — it opens the app in a new tab
 
-### Step 2 — Set up the backend (first run only)
+### Step 2 — Connect your Acquia account (first run only)
 
-The first time you click **Run Check**, if the local backend isn't
-running yet, the extension shows a **"Backend Not Running"** card with a
-single **Download Setup** button. No terminal commands, no typing:
+The first time you open the extension, it'll show a **"Connect Your
+Acquia Account"** card right in the tab:
 
-1. Click **Download Setup** — saves `AcquiaDNSFinderSetup.pkg` to your Downloads
-2. Open it from Downloads and click through the installer, exactly like
-   installing any other Mac app
-3. Come back to the extension tab and click **Run Check** again
+1. Go to **cloud.acquia.com** → your avatar (top right) → **Account
+   Settings → API Tokens**
+2. Click **Create Token**, then copy the **Key** and **Secret** shown
+3. Paste both into the extension and click **Save Credentials**
 
-That installer silently does the following for you:
-
-- copies the backend to `~/Library/Application Support/AcquiaDNSFinder`
-  (intentionally *not* run from wherever you cloned this repo — macOS
-  blocks background/`launchd` processes from reading files under
-  `Desktop`/`Documents`/`Downloads` unless you grant Full Disk Access;
-  `Application Support` sidesteps that entirely)
-- creates its Python virtualenv and installs dependencies
-- registers a macOS LaunchAgent
-  (`~/Library/LaunchAgents/com.acquia.aht-backend.plist`) that starts the
-  backend at login (`RunAtLoad`) and restarts it if it ever crashes
-  (`KeepAlive`), listening on `http://127.0.0.1:8001`
-
-After that one click-through, you never touch it again — not even after
-a restart.
-
-> If `aht` or `php` aren't on your PATH yet, the installer exits without
-> making changes. Get `aht` installed and authenticated first, then run
-> the installer again.
+That's stored locally in the browser via `chrome.storage` — it never
+leaves your machine except to authenticate directly with Acquia. You
+won't be asked again unless you uninstall the extension or clear its
+storage. Revisit it any time via the gear icon in the top bar.
 
 ---
 
@@ -80,10 +60,10 @@ a restart.
 3. Click **Run Check**
 4. Results show:
    - Overall repointing status (complete or incomplete)
-   - Per-environment details with load balancer EIP
-   - Per-domain DNS check with expected vs actual IPs
+   - Per-environment details with expected load balancer IP
+   - Per-domain DNS check with expected vs. actual resolved IP
    - A ready-to-paste Slack summary
-   - Raw `aht` command output, for when you need to double check
+   - Raw Acquia API response data, for when you need to double check
 
 ---
 
@@ -94,9 +74,7 @@ git pull
 ```
 
 Go to `chrome://extensions` → find Acquia DNS Finder → click the
-**reload icon** (↺). Only re-run the backend setup (click **Download
-Setup** again in the extension) if `backend.py` itself changed — the
-extension will tell you if the backend stops responding.
+**reload icon** (↺). Your saved API credentials are untouched by updates.
 
 ---
 
@@ -104,23 +82,17 @@ extension will tell you if the backend stops responding.
 
 **"Application Not Found" error**
 - Use only the docroot name (e.g. `iqstudent`, not `@iqstudent` or `iqstudent.prod`)
-- Confirm the application exists in CCI under that name
+- Confirm the application exists in CCI under that name and that your
+  Acquia account has access to it
 
-**"Backend Not Running" / "Cannot reach the backend on port 8001"**
-- Click **Download Setup** in that card and run the installer (see Installation above)
-- If the installer doesn't fix it, check: `curl http://localhost:8001/docs`
-- Check logs: `~/Library/Logs/aht-backend.log`, `aht-backend.err.log`,
-  and `/tmp/acquia-dns-finder-install.log` (installer's own log)
-- Confirm `aht` and `php` are on your PATH — the installer silently
-  refuses to set anything up if either is missing
+**"Connect Your Acquia Account" keeps showing up**
+- Double check the Key/Secret were copied without extra whitespace
+- Acquia API tokens don't expire by default, but can be revoked from the
+  Acquia Cloud UI — generate a new one if needed
 
 **Extension shows blank / won't load**
 - Go to `chrome://extensions` → reload the extension
 - Make sure you loaded the `build/` folder, not the project root
-
-**Terminal alternative**
-For debugging, or if you'd rather not use the `.pkg`, `./install.sh` in
-the repo root does the exact same setup from a terminal.
 
 ---
 
@@ -129,21 +101,22 @@ the repo root does the exact same setup from a terminal.
 - **Frontend**: a React app, built and loaded as an unpacked Chrome
   extension (`manifest_version: 3`). Clicking the toolbar icon opens it
   in a new tab via a minimal background service worker.
-- **Backend**: `backend.py` (FastAPI) shells out to the `aht` CLI,
-  strips ANSI codes from its output, and parses it into structured
-  JSON. It only listens on `127.0.0.1:8001` — never exposed externally.
-- **Auth**: handled entirely by your existing local `aht` configuration.
-  The extension never touches Acquia Cloud's UI, Okta, or any browser
-  session/token — there is nothing to capture or expire.
-- **Setup**: a Chrome extension can't install background services on
-  its own (browser sandboxing prevents that, by design — otherwise any
-  extension could silently run code on your machine). The extension's
-  "Download Setup" button works around this the same way installing any
-  other Mac app does: it downloads a `.pkg` (bundled inside the
-  extension itself, built by `scripts/build-pkg.sh`) that you open once
-  and click through. Its installer script is functionally identical to
-  `install.sh`, just packaged for a GUI double-click instead of a
-  terminal.
+- **Data**: `src/acquiaApi.js` talks directly to
+  `https://cloud.acquia.com/api` and `https://accounts.acquia.com` —
+  the same public, official Acquia Cloud Platform API v2 that backs the
+  Acquia Cloud UI and the `acli`/`aht` CLIs. It authenticates via OAuth2
+  client-credentials using your API Key/Secret, looks up the
+  application, fetches each environment's expected IP(s), and checks
+  each domain's live DNS resolution against them.
+- **Auth**: your API Key/Secret, entered once into the extension's own
+  Settings panel and stored via `chrome.storage.local`. Nothing is
+  proxied through a third-party server — every request goes straight
+  from your browser to Acquia.
+- **Why no backend**: a Chrome extension can't install or run local
+  background services on its own (browser sandboxing prevents that by
+  design). Calling Acquia's public REST API directly from the extension
+  sidesteps the need for one entirely — clone, load unpacked, paste in
+  an API key, done.
 
 ---
 

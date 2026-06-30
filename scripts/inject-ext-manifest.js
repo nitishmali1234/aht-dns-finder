@@ -13,10 +13,11 @@ const manifest = {
     service_worker: "background.js"
   },
   permissions: [
-    "downloads"
+    "storage"
   ],
   host_permissions: [
-    "http://localhost:8001/*"
+    "https://cloud.acquia.com/*",
+    "https://accounts.acquia.com/*"
   ],
   content_security_policy: {
     extension_pages: "script-src 'self'; object-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;"
