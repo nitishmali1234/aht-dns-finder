@@ -147,28 +147,16 @@ const DocRootError = ({ customer, message }) => (
   </div>
 );
 
-/* ─── Not signed in to Acquia Cloud ──────────────────────── */
+/* ─── Shared credentials revoked/invalid (maintainer-facing) ── */
 
-const SignInPrompt = () => (
+const CredentialsErrorCard = ({ message }) => (
   <div className="card">
     <div className="docroot-error">
       <div className="err-icon-ring">
         <Ico.AlertTri />
       </div>
-      <div className="err-title">Not Signed In To Acquia Cloud</div>
-      <div className="err-msg">
-        This extension reuses your existing Acquia Cloud login — no API
-        token, nothing to install. Log into Acquia Cloud in this browser,
-        then come back and run the check again.
-      </div>
-
-      <button
-        className="btn-run"
-        onClick={() => window.open("https://cloud.acquia.com", "_blank")}
-        style={{ margin: "4px auto 4px" }}
-      >
-        <Ico.Search /> Open Acquia Cloud
-      </button>
+      <div className="err-title">Acquia Connection Error</div>
+      <div className="err-msg">{message}</div>
     </div>
   </div>
 );
@@ -428,8 +416,8 @@ export default function App() {
         setError({ type: "generic", message: data.error || "An unexpected error occurred." });
       }
     } catch (e) {
-      if (e instanceof AcquiaApiError && e.status === "NO_SESSION") {
-        setError({ type: "no_session", message: e.message });
+      if (e instanceof AcquiaApiError && e.status === "BAD_CREDENTIALS") {
+        setError({ type: "bad_credentials", message: e.message });
       } else {
         setError({ type: "network", message: e.message || "An unexpected error occurred." });
       }
@@ -490,7 +478,7 @@ export default function App() {
               Checks all environments in one click.
             </p>
 
-            {!loading && error && !["invalid_docroot", "no_session"].includes(error.type) && (
+            {!loading && error && !["invalid_docroot", "bad_credentials"].includes(error.type) && (
               <div className="alert-bar alert-bar-error" style={{ marginTop: 12 }}>
                 <Ico.AlertTri />{error.message}
               </div>
@@ -506,8 +494,8 @@ export default function App() {
           <DocRootError customer={customer.trim()} message={error.message} />
         )}
 
-        {/* ── Not signed in to Acquia Cloud ───────────────────── */}
-        {!loading && error?.type === "no_session" && <SignInPrompt />}
+        {/* ── Shared credentials revoked/invalid ──────────────── */}
+        {!loading && error?.type === "bad_credentials" && <CredentialsErrorCard message={error.message} />}
 
         {/* ── Results ────────────────────────────────────────── */}
         {!loading && result && (
