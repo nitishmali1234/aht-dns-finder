@@ -87,26 +87,15 @@ async function apiGet(path) {
 export async function findApplication(name) {
   const needle = name.trim().toLowerCase();
 
-  // Try a server-side substring filter first (fast path).
-  const filter = encodeURIComponent(`hosting.id=@*${needle}*`);
-  let data = await apiGet(`/applications?filter=${filter}&limit=200`);
-  let items = data._embedded?.items ?? [];
-
-  let match = items.find((a) => {
-    const hostingId = (a.hosting?.id ?? "").toLowerCase();
-    const suffix = hostingId.includes(":") ? hostingId.split(":").pop() : hostingId;
-    return suffix === needle;
-  });
-
-  if (match) return match;
-
-  // Fall back to a fuller unfiltered scan (covers cases where the
-  // server-side filter isn't supported on this field, or returned a
-  // truncated set) — capped to keep this from running away on huge orgs.
+  // Acquia's filter API doesn't support dotted field paths like
+  // "hosting.id" (always 400s, regardless of operator), so this has
+  // to be a client-side scan over the application list rather than a
+  // server-side filter — capped to keep this from running away on
+  // huge orgs.
   for (let offset = 0; offset < 1000; offset += 200) {
-    data = await apiGet(`/applications?limit=200&offset=${offset}`);
-    items = data._embedded?.items ?? [];
-    match = items.find((a) => {
+    const data = await apiGet(`/applications?limit=200&offset=${offset}`);
+    const items = data._embedded?.items ?? [];
+    const match = items.find((a) => {
       const hostingId = (a.hosting?.id ?? "").toLowerCase();
       const suffix = hostingId.includes(":") ? hostingId.split(":").pop() : hostingId;
       return suffix === needle;
