@@ -10,6 +10,9 @@
 
 # production
 # /build is intentionally committed so teammates don't need Node.js
+# Chrome writes this into the unpacked extension folder at load time —
+# local runtime state, not a build output
+build/_metadata
 
 # misc
 .DS_Store
