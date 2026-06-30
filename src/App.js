@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import "./App.css";
 import { runFullCheck, AcquiaApiError } from "./acquiaApi";
 
@@ -147,87 +147,31 @@ const DocRootError = ({ customer, message }) => (
   </div>
 );
 
-/* ─── Settings — Acquia API Key/Secret entry ─────────────── */
+/* ─── Not signed in to Acquia Cloud ──────────────────────── */
 
-const SettingsCard = ({ onSaved, embedded }) => {
-  const [apiKey, setApiKey] = useState("");
-  const [apiSecret, setApiSecret] = useState("");
-  const [saved, setSaved] = useState(false);
-
-  useEffect(() => {
-    chrome.storage.local.get(["apiKey", "apiSecret"]).then((v) => {
-      if (v.apiKey) setApiKey(v.apiKey);
-      if (v.apiSecret) setApiSecret(v.apiSecret);
-    });
-  }, []);
-
-  const save = async () => {
-    await chrome.storage.local.set({ apiKey: apiKey.trim(), apiSecret: apiSecret.trim() });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
-    onSaved?.();
-  };
-
-  return (
-    <div className={embedded ? "" : "card"}>
-      <div className="docroot-error">
-        {!embedded && (
-          <>
-            <div className="err-icon-ring">
-              <Ico.AlertTri />
-            </div>
-            <div className="err-title">Connect Your Acquia Account</div>
-            <div className="err-msg">
-              This extension talks directly to the Acquia Cloud Platform API —
-              there's no local backend to install. Paste your API Key and
-              Secret below (one-time, stored only in this browser).
-            </div>
-          </>
-        )}
-
-        <div className="setup-steps" style={{ textAlign: "left" }}>
-          <div className="setup-step">
-            <span className="setup-step-n">1</span>
-            Go to <strong>cloud.acquia.com</strong> → your avatar → <strong>Account Settings → API Tokens</strong>
-          </div>
-          <div className="setup-step">
-            <span className="setup-step-n">2</span>
-            Click <strong>Create Token</strong>, then copy the Key and Secret shown
-          </div>
-        </div>
-
-        <input
-          className="search-input"
-          style={{ width: "100%", marginTop: 14 }}
-          placeholder="API Key"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-        />
-        <input
-          className="search-input"
-          style={{ width: "100%", marginTop: 8 }}
-          placeholder="API Secret"
-          type="password"
-          value={apiSecret}
-          onChange={(e) => setApiSecret(e.target.value)}
-        />
-
-        <button
-          className="btn-run"
-          onClick={save}
-          disabled={!apiKey.trim() || !apiSecret.trim()}
-          style={{ margin: "14px auto 4px" }}
-        >
-          <Ico.Search /> {saved ? "Saved" : "Save Credentials"}
-        </button>
-
-        <div className="err-hint" style={{ marginTop: 10 }}>
-          Stored locally via <code>chrome.storage</code> — never leaves this browser except to authenticate directly with Acquia.
-        </div>
+const SignInPrompt = () => (
+  <div className="card">
+    <div className="docroot-error">
+      <div className="err-icon-ring">
+        <Ico.AlertTri />
       </div>
+      <div className="err-title">Not Signed In To Acquia Cloud</div>
+      <div className="err-msg">
+        This extension reuses your existing Acquia Cloud login — no API
+        token, nothing to install. Log into Acquia Cloud in this browser,
+        then come back and run the check again.
+      </div>
+
+      <button
+        className="btn-run"
+        onClick={() => window.open("https://cloud.acquia.com", "_blank")}
+        style={{ margin: "4px auto 4px" }}
+      >
+        <Ico.Search /> Open Acquia Cloud
+      </button>
     </div>
-  );
-};
+  </div>
+);
 
 /* ─── Status pill ────────────────────────────────────────── */
 
@@ -466,14 +410,6 @@ export default function App() {
   const [scanStep, setScanStep] = useState(0);
   const [result,   setResult]   = useState(null);
   const [error,    setError]    = useState(null); // { type, message }
-  const [hasCreds, setHasCreds] = useState(null); // null = unknown yet, bool once checked
-  const [showSettings, setShowSettings] = useState(false);
-
-  useEffect(() => {
-    chrome.storage.local.get(["apiKey", "apiSecret"]).then((v) => {
-      setHasCreds(!!(v.apiKey && v.apiSecret));
-    });
-  }, []);
 
   const runCheck = async () => {
     const name = customer.trim();
@@ -492,11 +428,8 @@ export default function App() {
         setError({ type: "generic", message: data.error || "An unexpected error occurred." });
       }
     } catch (e) {
-      if (e instanceof AcquiaApiError && e.status === "NO_CREDENTIALS") {
-        setHasCreds(false);
-        setError({ type: "no_credentials", message: e.message });
-      } else if (e instanceof AcquiaApiError && e.status === "BAD_CREDENTIALS") {
-        setError({ type: "bad_credentials", message: e.message });
+      if (e instanceof AcquiaApiError && e.status === "NO_SESSION") {
+        setError({ type: "no_session", message: e.message });
       } else {
         setError({ type: "network", message: e.message || "An unexpected error occurred." });
       }
@@ -521,33 +454,11 @@ export default function App() {
           <div className="topbar-right">
             <div className="topbar-live"><span className="live-dot" />Live</div>
             <span className="topbar-tag">Internal</span>
-            <button
-              className="btn-run"
-              style={{ padding: "6px 10px", marginLeft: 10 }}
-              onClick={() => setShowSettings(s => !s)}
-              title="Acquia API credentials"
-            >
-              <Ico.Gear />
-            </button>
           </div>
         </div>
       </header>
 
       <main className="main">
-
-        {/* ── Settings ───────────────────────────────────────── */}
-        {showSettings && (
-          <div className="card">
-            <SettingsCard
-              embedded
-              onSaved={() => {
-                setHasCreds(true);
-                setShowSettings(false);
-                if (error?.type === "no_credentials" || error?.type === "bad_credentials") setError(null);
-              }}
-            />
-          </div>
-        )}
 
         {/* ── Query ──────────────────────────────────────────── */}
         <div className="card">
@@ -579,7 +490,7 @@ export default function App() {
               Checks all environments in one click.
             </p>
 
-            {!loading && error && !["invalid_docroot", "no_credentials", "bad_credentials"].includes(error.type) && (
+            {!loading && error && !["invalid_docroot", "no_session"].includes(error.type) && (
               <div className="alert-bar alert-bar-error" style={{ marginTop: 12 }}>
                 <Ico.AlertTri />{error.message}
               </div>
@@ -595,10 +506,8 @@ export default function App() {
           <DocRootError customer={customer.trim()} message={error.message} />
         )}
 
-        {/* ── No / bad credentials ────────────────────────────── */}
-        {!loading && (error?.type === "no_credentials" || error?.type === "bad_credentials" || hasCreds === false) && !showSettings && (
-          <SettingsCard onSaved={() => { setHasCreds(true); setError(null); }} />
-        )}
+        {/* ── Not signed in to Acquia Cloud ───────────────────── */}
+        {!loading && error?.type === "no_session" && <SignInPrompt />}
 
         {/* ── Results ────────────────────────────────────────── */}
         {!loading && result && (
@@ -614,7 +523,7 @@ export default function App() {
                   <Ico.List /> Domain Check
                   <span className="count-pill">{result.domains.length}</span>
                 </span>
-                <span className="card-head-meta">aht @{result.customer} dc</span>
+                <span className="card-head-meta">{result.application?.hosting_id || result.customer}</span>
               </div>
 
               {prod.length > 0 && (

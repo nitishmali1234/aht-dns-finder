@@ -1,14 +1,22 @@
 /* ─── Acquia Cloud Platform API v2 client ────────────────────
  * Talks directly to cloud.acquia.com from inside the extension —
- * no local backend, no CLI, no install step beyond entering an
- * API Key/Secret (generated once from Acquia Cloud UI → Account
- * Settings → API Tokens).
+ * no local backend, no CLI, no API token. Auth is borrowed from
+ * your existing logged-in Acquia Cloud UI browser session: every
+ * request goes out with `credentials: "include"` so the browser
+ * attaches whatever session cookie cloud.acquia.com already set
+ * when you logged in there (Google SSO or otherwise).
+ *
+ * This is best-effort and unofficial — Acquia's public REST API is
+ * documented as accepting only OAuth2 bearer tokens, not session
+ * cookies. It works only if Acquia's API gateway happens to also
+ * honor the UI session cookie for these endpoints, and only if that
+ * cookie's SameSite policy permits it being sent on a cross-origin
+ * request from a chrome-extension:// page. If it doesn't, every call
+ * comes back 401/403 and there is no automatic fallback by design —
+ * see error type NO_SESSION below.
  */
 
-const TOKEN_URL = "https://accounts.acquia.com/api/auth/oauth/token";
 const API_BASE = "https://cloud.acquia.com/api";
-
-let cachedToken = null; // { value, expiresAt }
 
 export class AcquiaApiError extends Error {
   constructor(message, status) {
@@ -18,67 +26,22 @@ export class AcquiaApiError extends Error {
   }
 }
 
-async function getCredentials() {
-  const { apiKey, apiSecret } = await chrome.storage.local.get(["apiKey", "apiSecret"]);
-  if (!apiKey || !apiSecret) {
-    throw new AcquiaApiError("No Acquia API credentials configured.", "NO_CREDENTIALS");
-  }
-  return { apiKey, apiSecret };
-}
-
-async function getToken() {
-  if (cachedToken && cachedToken.expiresAt > Date.now() + 10_000) {
-    return cachedToken.value;
-  }
-
-  const { apiKey, apiSecret } = await getCredentials();
-
-  const body = new URLSearchParams({
-    client_id: apiKey,
-    client_secret: apiSecret,
-    grant_type: "client_credentials",
-  });
-
-  let res;
-  try {
-    res = await fetch(TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body,
-    });
-  } catch (e) {
-    throw new AcquiaApiError(`Cannot reach Acquia Cloud (${e.message}).`, "NETWORK");
-  }
-
-  if (!res.ok) {
-    if (res.status === 401 || res.status === 400) {
-      throw new AcquiaApiError("Invalid API Key/Secret. Check your credentials in Settings.", "BAD_CREDENTIALS");
-    }
-    throw new AcquiaApiError(`Acquia auth failed (HTTP ${res.status}).`, res.status);
-  }
-
-  const data = await res.json();
-  cachedToken = {
-    value: data.access_token,
-    expiresAt: Date.now() + (data.expires_in ?? 300) * 1000,
-  };
-  return cachedToken.value;
-}
-
 async function apiGet(path) {
-  const token = await getToken();
   let res;
   try {
     res = await fetch(`${API_BASE}${path}`, {
-      headers: { Authorization: `Bearer ${token}` },
+      credentials: "include",
+      headers: { Accept: "application/hal+json, application/json" },
     });
   } catch (e) {
     throw new AcquiaApiError(`Cannot reach Acquia Cloud (${e.message}).`, "NETWORK");
   }
 
-  if (res.status === 401) {
-    cachedToken = null; // force a fresh token on next call
-    throw new AcquiaApiError("Acquia session expired mid-request. Please run the check again.", 401);
+  if (res.status === 401 || res.status === 403) {
+    throw new AcquiaApiError(
+      "Not signed in to Acquia Cloud. Log into cloud.acquia.com in this browser, then try again.",
+      "NO_SESSION"
+    );
   }
   if (!res.ok) {
     throw new AcquiaApiError(`Acquia API error (HTTP ${res.status}) for ${path}`, res.status);

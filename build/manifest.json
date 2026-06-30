@@ -9,9 +9,6 @@
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": [
-    "storage"
-  ],
   "host_permissions": [
     "https://cloud.acquia.com/*",
     "https://accounts.acquia.com/*"

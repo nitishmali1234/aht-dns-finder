@@ -4,12 +4,20 @@ A Chrome Extension for T1 Support Engineers to check DNS repointing status
 for Acquia hosted applications. Opens in a full browser tab and runs a
 DNS repointing check against a single application in one click.
 
-**No local backend, no CLI, no install script, nothing to run in a
-terminal.** The extension calls the official **Acquia Cloud Platform
-API** directly from the browser. The only one-time step is pasting your
-own Acquia API Key/Secret into the extension's Settings panel — the same
-kind of thing you'd do for any extension that needs to authenticate
-(GitHub, Slack, etc.).
+**No local backend, no CLI, no install script, no API token to generate
+or paste in.** The extension calls the Acquia Cloud Platform API
+directly from the browser, reusing whatever Acquia Cloud session is
+already active in your browser — the same login you already use to
+visit cloud.acquia.com day to day. Clone the repo, load the extension,
+done.
+
+> **Experimental auth.** This relies on your browser's existing Acquia
+> Cloud session cookie rather than Acquia's officially documented OAuth
+> token flow. It is not a supported integration pattern, and it may stop
+> working without warning if Acquia changes how their session is
+> structured. See [How it works](#how-it-works) for the specifics and
+> the [Troubleshooting](#troubleshooting) section if it's not picking up
+> your session.
 
 ---
 
@@ -18,15 +26,13 @@ kind of thing you'd do for any extension that needs to authenticate
 | Requirement | Notes |
 |---|---|
 | Google Chrome | Any recent version |
-| Acquia Cloud API Key/Secret | Generated once from Acquia Cloud UI (see below) |
+| An active Acquia Cloud login | Just be logged into cloud.acquia.com in the same browser |
 
-That's it — no `aht`, no `php`, no Python, no local server.
+That's it — no `aht`, no `php`, no Python, no local server, no API key.
 
 ---
 
 ## Installation (one time)
-
-### Step 1 — Load the extension
 
 1. Clone this repo
 2. Open Chrome → go to **`chrome://extensions`**
@@ -35,20 +41,8 @@ That's it — no `aht`, no `php`, no Python, no local server.
 5. Select the **`build`** folder inside this repo
 6. Click the extension icon — it opens the app in a new tab
 
-### Step 2 — Connect your Acquia account (first run only)
-
-The first time you open the extension, it'll show a **"Connect Your
-Acquia Account"** card right in the tab:
-
-1. Go to **cloud.acquia.com** → your avatar (top right) → **Account
-   Settings → API Tokens**
-2. Click **Create Token**, then copy the **Key** and **Secret** shown
-3. Paste both into the extension and click **Save Credentials**
-
-That's stored locally in the browser via `chrome.storage` — it never
-leaves your machine except to authenticate directly with Acquia. You
-won't be asked again unless you uninstall the extension or clear its
-storage. Revisit it any time via the gear icon in the top bar.
+If you're already logged into Acquia Cloud in that browser, you're done
+— just type an application name and run a check.
 
 ---
 
@@ -74,25 +68,37 @@ git pull
 ```
 
 Go to `chrome://extensions` → find Acquia DNS Finder → click the
-**reload icon** (↺). Your saved API credentials are untouched by updates.
+**reload icon** (↺).
 
 ---
 
 ## Troubleshooting
+
+**"Not Signed In To Acquia Cloud"**
+- Open cloud.acquia.com in the same Chrome profile/browser the extension
+  is running in, log in, then come back and run the check again
+- If you're already logged in and still see this, your Acquia session
+  cookie likely isn't being sent on the extension's requests (commonly a
+  `SameSite` cookie restriction) — see *Known limitation* below
 
 **"Application Not Found" error**
 - Use only the docroot name (e.g. `iqstudent`, not `@iqstudent` or `iqstudent.prod`)
 - Confirm the application exists in CCI under that name and that your
   Acquia account has access to it
 
-**"Connect Your Acquia Account" keeps showing up**
-- Double check the Key/Secret were copied without extra whitespace
-- Acquia API tokens don't expire by default, but can be revoked from the
-  Acquia Cloud UI — generate a new one if needed
-
 **Extension shows blank / won't load**
 - Go to `chrome://extensions` → reload the extension
 - Make sure you loaded the `build/` folder, not the project root
+
+**Known limitation**
+Acquia's public REST API is documented as accepting only OAuth2 bearer
+tokens, not browser session cookies. This extension works *if* Acquia's
+API gateway happens to also honor the Cloud UI's session cookie for
+these endpoints, and *if* that cookie's `SameSite` policy allows it to
+be sent on a cross-origin request from a `chrome-extension://` page. If
+either of those isn't true, every request will come back 401/403
+regardless of being logged in, and there is currently no fallback —
+that's the deliberate tradeoff for having zero tokens to manage.
 
 ---
 
@@ -102,21 +108,22 @@ Go to `chrome://extensions` → find Acquia DNS Finder → click the
   extension (`manifest_version: 3`). Clicking the toolbar icon opens it
   in a new tab via a minimal background service worker.
 - **Data**: `src/acquiaApi.js` talks directly to
-  `https://cloud.acquia.com/api` and `https://accounts.acquia.com` —
-  the same public, official Acquia Cloud Platform API v2 that backs the
-  Acquia Cloud UI and the `acli`/`aht` CLIs. It authenticates via OAuth2
-  client-credentials using your API Key/Secret, looks up the
-  application, fetches each environment's expected IP(s), and checks
-  each domain's live DNS resolution against them.
-- **Auth**: your API Key/Secret, entered once into the extension's own
-  Settings panel and stored via `chrome.storage.local`. Nothing is
-  proxied through a third-party server — every request goes straight
-  from your browser to Acquia.
-- **Why no backend**: a Chrome extension can't install or run local
-  background services on its own (browser sandboxing prevents that by
-  design). Calling Acquia's public REST API directly from the extension
-  sidesteps the need for one entirely — clone, load unpacked, paste in
-  an API key, done.
+  `https://cloud.acquia.com/api` — the same public Acquia Cloud Platform
+  API v2 that backs the Acquia Cloud UI. It looks up the application,
+  fetches each environment's expected IP(s), and checks each domain's
+  live DNS resolution against them.
+- **Auth**: every request is sent with `credentials: "include"`, so the
+  browser attaches whatever Acquia session cookie already exists for
+  `cloud.acquia.com` — no API key is ever requested, stored, or sent.
+  Nothing is proxied through a third-party server; every request goes
+  straight from your browser to Acquia.
+- **Why no backend, why no token**: a Chrome extension can't install or
+  run local background services on its own (browser sandboxing prevents
+  that by design), which rules out driving a local CLI. Acquia's public
+  REST API only documents OAuth2 bearer-token auth, which would mean
+  asking every engineer to generate and paste in an API key. Reusing the
+  existing Cloud UI session avoids both — at the cost of being an
+  unofficial, best-effort technique rather than a documented one.
 
 ---
 
