@@ -1,10 +1,13 @@
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
-const isDev = require('electron-is-dev');
+const fs = require('fs');
 
 let mainWindow;
 let serverProcess;
+
+// Check if running in development (has node_modules in parent, not packaged)
+const isDev = fs.existsSync(path.join(__dirname, '../node_modules'));
 
 // Start the Node backend server
 function startServer() {
@@ -42,6 +45,8 @@ function createWindow() {
     ? 'http://localhost:3000'
     : `file://${path.join(__dirname, '../build/index.html')}`;
 
+  console.log('Loading URL:', startUrl);
+  console.log('isDev:', isDev);
   mainWindow.loadURL(startUrl);
 
   if (isDev) {
