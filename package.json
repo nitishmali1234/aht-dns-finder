@@ -1,31 +1,38 @@
 {
   "name": "aht-runner",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
+  "main": "public/electron.js",
+  "homepage": "./",
   "dependencies": {
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^13.5.0",
+    "concurrently": "^10.0.3",
+    "cors": "^2.8.6",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-scripts": "5.0.1",
+    "wait-on": "^9.0.10",
     "web-vitals": "^2.1.4"
   },
   "scripts": {
-    "start": "react-scripts start",
-    "build": "react-scripts build && node scripts/inject-ext-manifest.js",
+    "react-start": "react-scripts start",
+    "react-build": "react-scripts build",
+    "electron-dev": "concurrently \"npm run react-start\" \"wait-on http://localhost:3000 && electron .\"",
+    "electron-build": "npm run react-build && electron-builder",
+    "start": "npm run electron-dev",
+    "build": "npm run electron-build",
     "test": "react-scripts test",
-    "eject": "react-scripts eject"
+    "eject": "react-scripts eject",
+    "server": "node server.js"
   },
   "eslintConfig": {
     "extends": [
       "react-app",
       "react-app/jest"
-    ],
-    "globals": {
-      "chrome": "readonly"
-    }
+    ]
   },
   "browserslist": {
     "production": [
@@ -38,5 +45,41 @@
       "last 1 firefox version",
       "last 1 safari version"
     ]
+  },
+  "build": {
+    "appId": "com.aht-runner.app",
+    "productName": "AHT Runner",
+    "files": [
+      "build/**/*",
+      "public/electron.js",
+      "server.js"
+    ],
+    "directories": {
+      "buildResources": "public"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.utilities"
+    },
+    "win": {
+      "target": [
+        "installer",
+        "portable"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3",
+    "electron-is-dev": "^3.0.1"
   }
 }

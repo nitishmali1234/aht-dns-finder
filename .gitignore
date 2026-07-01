@@ -9,10 +9,7 @@
 /coverage
 
 # production
-# /build is intentionally committed so teammates don't need Node.js
-# Chrome writes this into the unpacked extension folder at load time —
-# local runtime state, not a build output
-build/_metadata
+/build
 
 # misc
 .DS_Store
@@ -24,3 +21,8 @@ build/_metadata
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Electron dist folder (large binary files - users can build with npm run electron-build)
+dist/
+
+

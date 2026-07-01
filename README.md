@@ -1,14 +1,10 @@
-# Acquia DNS Finder
+# AHT Runner
 
-A Chrome Extension for T1 Support Engineers to check DNS repointing status
-for Acquia hosted applications. Opens in a full browser tab and runs a
-DNS repointing check against a single application in one click.
+A desktop application that runs AHT commands automatically with a simple UI.
+Users can enter an app name and the app automatically runs `aht a:i`, `aht server`, `aht dc`,
+and `aht do:li`, displaying results in real-time.
 
-**No local backend, no CLI, no install script, no per-engineer login or
-token.** The extension calls the Acquia Cloud Platform API directly from
-the browser, authenticated with a single shared internal API
-Key/Secret baked into the build. Clone the repo, load the extension,
-done — nothing to configure.
+**Zero-configuration.** Clone repo → Double-click the app → It works. That's it.
 
 ---
 
@@ -16,120 +12,125 @@ done — nothing to configure.
 
 | Requirement | Notes |
 |---|---|
-| Google Chrome | Any recent version |
-
-That's it — no `aht`, no `php`, no Python, no local server, no personal
-Acquia login or API key.
+| macOS 10.13+ | Currently packaged for macOS (arm64 Apple Silicon) |
+| AHT CLI | Must be installed on your machine and available in `$PATH` |
 
 ---
 
-## Installation (one time)
+## Installation
 
-1. Clone this repo
-2. Open Chrome → go to **`chrome://extensions`**
-3. Toggle **Developer mode** ON (top-right corner)
-4. Click **Load unpacked**
-5. Select the **`build`** folder inside this repo
-6. Click the extension icon — it opens the app in a new tab and works immediately
+### For Non-Technical Users (Recommended)
+
+1. Clone this repository or download it
+2. Go to the `dist/` folder
+3. Double-click **`AHT Runner-1.0.0-arm64.dmg`**
+4. Drag "AHT Runner" to the Applications folder
+5. Open Applications → Double-click "AHT Runner"
+6. Enter app name and run commands
+
+**That's it. No npm, no terminals, no configuration.**
 
 ---
 
 ## How to Use
 
-1. Click the **Acquia DNS Finder** icon in your Chrome toolbar — opens in a new tab
-2. Type the **application name / docroot** in the search box (e.g. `iqstudent`)
-   - Application name only — no `@` prefix, no `.prod` suffix
-3. Click **Run Check**
-4. Results show:
-   - Overall repointing status (complete or incomplete)
-   - Per-environment details with expected load balancer IP
-   - Per-domain DNS check with expected vs. actual resolved IP
-   - A ready-to-paste Slack summary
-   - Raw Acquia API response data, for when you need to double check
-
----
-
-## Updating
-
-```
-git pull
-```
-
-Go to `chrome://extensions` → find Acquia DNS Finder → click the
-**reload icon** (↺).
+1. Launch the **AHT Runner** app
+2. Enter an **app name** (e.g., `myapp`)
+3. Click **Run AHT Commands**
+4. Watch the progress as all four commands execute
+5. Results display with full command output
 
 ---
 
 ## Troubleshooting
 
-**"Acquia Connection Error"**
-- The shared credentials baked into the build have been revoked or
-  expired — this isn't something an individual engineer can fix; flag
-  it to whoever maintains this repo (see *For maintainers* below)
+**"command not found: aht"**
+- AHT CLI is not installed or not in your PATH
+- Install AHT on your machine
+- Verify from terminal: `aht --help`
 
-**"Application Not Found" error**
-- Use only the docroot name (e.g. `iqstudent`, not `@iqstudent` or `iqstudent.prod`)
-- Confirm the application exists in CCI under that name and that the
-  shared service account has access to it
+**App won't start**
+- Verify AHT is properly installed and accessible from terminal
+- Check that port 3001 is not blocked by firewall
 
-**Extension shows blank / won't load**
-- Go to `chrome://extensions` → reload the extension
-- Make sure you loaded the `build/` folder, not the project root
-
----
-
-## For maintainers — rotating the shared credentials
-
-This extension authenticates with one shared Acquia API Key/Secret,
-generated from a team/service Acquia Cloud account (Account Settings →
-API Tokens), stored in `src/acquiaConfig.js`. If it's ever revoked or
-needs rotating:
-
-1. Generate a new token from the service account in Acquia Cloud UI
-2. Update `ACQUIA_API_KEY` / `ACQUIA_API_SECRET` in `src/acquiaConfig.js`
-3. `npm run build` (only the maintainer needs Node for this — `build/`
-   is committed so engineers don't)
-4. Commit and push — engineers pick it up on their next `git pull` +
-   extension reload
-
-This token is visible to anyone who inspects the extension's compiled
-JS, by design — there is no way to ship a fully zero-setup, zero-login
-extension without an embedded credential of some kind. Acceptable here
-because distribution is internal-only and the service account should
-be scoped to no more access than support already has.
+**Results show errors**
+- Verify the app name is correct
+- Ensure you have AHT access for that app
 
 ---
 
-## How it works
+## For Developers — Building from Source
 
-- **Frontend**: a React app, built and loaded as an unpacked Chrome
-  extension (`manifest_version: 3`). Clicking the toolbar icon opens it
-  in a new tab via a minimal background service worker.
-- **Data**: `src/acquiaApi.js` talks directly to
-  `https://cloud.acquia.com/api` — the same public Acquia Cloud Platform
-  API v2 that backs the Acquia Cloud UI. It looks up the application,
-  fetches each environment's expected IP(s), and checks each domain's
-  live DNS resolution against them.
-- **Auth**: `src/acquiaConfig.js` holds a shared API Key/Secret used via
-  Acquia's standard OAuth2 `client_credentials` flow
-  (`accounts.acquia.com/api/auth/oauth/token`) to get a short-lived
-  bearer token, refreshed automatically as needed. No engineer ever
-  sees, enters, or manages a credential.
-- **Why the header rule (`public/rules.json`)**: Acquia's identity
-  provider (Okta-backed) rejects `client_credentials` token requests
-  that carry a browser `Origin` header — it's a deliberate anti-abuse
-  check that demands PKCE for anything it can tell came from a browser.
-  A `declarativeNetRequest` rule strips the `Origin` header on just
-  that one request before it leaves Chrome, so it's indistinguishable
-  from a normal server-to-server call (the same reason a plain `curl`
-  request works). This is the same header-rewriting mechanism used by
-  extensions like ModHeader — no external server, no hosting, no
-  account, purely client-side.
-- **Why no backend**: a Chrome extension can't install or run local
-  background services on its own (browser sandboxing prevents that by
-  design), which rules out driving a local CLI directly. Calling
-  Acquia's public REST API from the extension sidesteps that entirely.
+### Prerequisites
+- Node.js 16+ and npm
+- AHT CLI installed
+
+### Build Steps
+
+```bash
+# Clone and setup
+git clone <repo-url>
+cd aht-runner-COPY
+npm install
+
+# Development with hot reload
+npm start
+
+# Build production app
+npm run build
+
+# Build installers for all platforms
+npm run electron-build
+```
+
+Production packages appear in `dist/`:
+- **macOS**: `AHT Runner-1.0.0-arm64.dmg` (ready to distribute)
+- **macOS ZIP**: For manual distribution if needed
+- Other platforms: Modify electron-builder config in `package.json`
+
+---
+
+## Architecture
+
+- **Frontend**: React UI (clean, simple input/output)
+- **Backend**: Node.js + Express (executes AHT commands)
+- **Desktop**: Electron (auto-launches server + UI on app start)
+- **Packaging**: electron-builder (cross-platform installers)
+
+User flow:
+1. User launches app
+2. Electron main process starts
+3. Backend server auto-spawns on localhost:3001
+4. React UI opens in window
+5. User enters app name and runs commands
+6. Everything is transparent—users never see a terminal
+
+---
+
+## Project Structure
+
+```
+.
+├── public/
+│   ├── electron.js          # Electron main process
+│   ├── index.html
+│   └── favicon.ico
+├── src/
+│   ├── App.js              # React UI component
+│   ├── App.css
+│   ├── index.js
+│   └── index.css
+├── server.js               # Node.js backend (executes AHT commands)
+├── package.json            # Scripts, dependencies, Electron config
+├── dist/                   # Packaged apps ready to distribute
+│   ├── AHT Runner-1.0.0-arm64.dmg
+│   └── AHT Runner-1.0.0-arm64-mac.zip
+└── README.md
+```
 
 ---
 
 *Internal tool — Acquia T1 Support*
+
+
+
