@@ -19,16 +19,21 @@ and `aht do:li`, displaying results in real-time.
 
 ## Installation
 
-### For Non-Technical Users (Recommended)
+### For Non-Technical Users
 
 1. Clone this repository or download it
-2. Go to the `dist/` folder
-3. Double-click **`AHT Runner-1.0.0-arm64.dmg`**
-4. Drag "AHT Runner" to the Applications folder
-5. Open Applications → Double-click "AHT Runner"
-6. Enter app name and run commands
+2. In the project folder, run:
+   ```bash
+   npm install
+   npm run electron-build
+   ```
+3. Go to the `dist/` folder
+4. Double-click **`AHT Runner-1.0.0-arm64.dmg`**
+5. Drag "AHT Runner" to the Applications folder
+6. Open Applications → Double-click "AHT Runner"
+7. Enter app name and run commands
 
-**That's it. No npm, no terminals, no configuration.**
+**That's it. The app is fully standalone after installation.**
 
 ---
 
