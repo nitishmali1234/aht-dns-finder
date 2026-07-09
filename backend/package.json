@@ -1,0 +1,32 @@
+{
+  "name": "aht-query-backend",
+  "version": "1.0.0",
+  "description": "Backend server that shells out to the aht CLI and returns parsed results",
+  "main": "server.js",
+  "bin": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "build:mac": "pkg . --targets node18-macos-x64,node18-macos-arm64 --output dist/aht-query-backend-mac",
+    "build:win": "pkg . --targets node18-win-x64 --output dist/aht-query-backend-win.exe",
+    "build:all": "npm run build:mac && npm run build:win"
+  },
+  "pkg": {
+    "assets": [
+      "parser.js"
+    ],
+    "targets": [
+      "node18-macos-x64",
+      "node18-macos-arm64",
+      "node18-win-x64"
+    ],
+    "outputPath": "dist"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}

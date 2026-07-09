@@ -1,0 +1,105 @@
+.server-info-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.eip-highlight {
+  background-color: rgba(217, 119, 6, 0.1);
+  border: 1px solid rgba(217, 119, 6, 0.35);
+  border-radius: 6px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.eip-label {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: #f59e0b;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.eip-value-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.eip-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+.eip-copy-btn {
+  background-color: rgba(217, 119, 6, 0.2);
+  color: #f59e0b;
+  border: 1px solid rgba(217, 119, 6, 0.4);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.eip-copy-btn:hover {
+  background-color: rgba(217, 119, 6, 0.3);
+}
+
+.server-info-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.info-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.info-label {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: #667788;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.info-value {
+  font-size: 0.8125rem;
+  color: #e1e8ed;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.server-config-details {
+  border: 1px solid #2a3a4a;
+  border-radius: 6px;
+  padding: 10px 14px;
+}
+
+.server-config-details summary {
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: #8899a6;
+}
+
+.server-config-raw {
+  margin-top: 10px;
+  background-color: #0f1419;
+  border-radius: 4px;
+  padding: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: #c8d6e5;
+  overflow-x: auto;
+  white-space: pre;
+  max-height: 300px;
+  overflow-y: auto;
+}

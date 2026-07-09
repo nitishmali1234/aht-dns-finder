@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build/packaging output
+electron-app/dist/
+frontend/build/
+
+# OS files
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/
+.idea/

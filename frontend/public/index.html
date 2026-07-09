@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AHT Query Interface</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <h1 class="app-title">AHT Query Interface</h1>
+      <span class="app-subtitle">Acquia Hosting Toolkit — Local CLI Bridge</span>
+    </header>
+
+    <main class="app-main">
+      <div class="query-panel">
+        <h2 class="query-panel-title">Query Parameters</h2>
+        <div class="query-panel-inputs">
+          <div class="input-group">
+            <label class="input-label" for="app-name">
+              Application / Docroot Name <span class="required">*</span>
+            </label>
+            <input id="app-name" type="text" class="input-field" placeholder="e.g. acquia, rcn, marriott" autocomplete="off" />
+            <span class="input-helper">Provide the sitegroup/application name</span>
+            <span class="input-error" id="app-name-error"></span>
+          </div>
+          <div class="input-group">
+            <label class="input-label" for="env-name">Environment</label>
+            <input id="env-name" type="text" class="input-field" placeholder="e.g. prod, 01live" autocomplete="off" />
+            <span class="input-helper">Provide the environment name</span>
+            <span class="input-error" id="env-name-error"></span>
+          </div>
+        </div>
+        <div class="query-panel-actions">
+          <button class="btn btn-blue" id="btn-get-env">GET ENVIRONMENTS</button>
+          <button class="btn btn-purple" id="btn-get-domains">DOMAIN LIST</button>
+          <button class="btn btn-green" id="btn-check-domains">DOMAINS POINTED</button>
+          <button class="btn btn-outlined" id="btn-clear">CLEAR RESULTS</button>
+        </div>
+
+        <div class="query-panel-divider"></div>
+
+        <h2 class="query-panel-title">Server Lookup</h2>
+        <p class="query-panel-subtitle">
+          Look up a single server by hostname — used for finding the EIP when repointing customer DNS.
+        </p>
+        <div class="query-panel-inputs query-panel-inputs-single">
+          <div class="input-group">
+            <label class="input-label" for="server-name">Server Name</label>
+            <input id="server-name" type="text" class="input-field" placeholder="e.g. bal-12345" autocomplete="off" />
+            <span class="input-helper">Enter the server hostname (e.g. bal-12345, web-4836)</span>
+            <span class="input-error" id="server-name-error"></span>
+          </div>
+        </div>
+        <div class="query-panel-actions">
+          <button class="btn btn-amber" id="btn-get-server">GET SERVER INFO</button>
+        </div>
+
+        <div class="query-panel-divider"></div>
+
+        <h2 class="query-panel-title">DNS Lookup (dig)</h2>
+        <p class="query-panel-subtitle">
+          Look up where a domain currently points. Paste a bare domain or a full URL — the protocol and path are stripped automatically.
+        </p>
+        <div class="query-panel-inputs query-panel-inputs-single">
+          <div class="input-group">
+            <label class="input-label" for="dig-hostname">Hostname / URL</label>
+            <input id="dig-hostname" type="text" class="input-field" placeholder="e.g. www.example.com" autocomplete="off" />
+            <span class="input-helper">A full URL like https://example.com/page works too</span>
+          </div>
+        </div>
+        <div class="query-panel-actions">
+          <button class="btn btn-cyan" id="btn-run-dig">RUN DIG</button>
+        </div>
+      </div>
+
+      <div class="results-panel" id="results-panel">
+        <div class="results-empty">
+          <span class="empty-icon">⌘</span>
+          <p>Run a query to see results here.</p>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

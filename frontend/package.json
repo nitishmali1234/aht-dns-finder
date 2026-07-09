@@ -1,0 +1,6 @@
+{
+  "name": "aht-query-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "No build step: the served frontend is the plain HTML/CSS/JS in public/. This package.json (and src.legacy-react/, node_modules/) is kept only as an archive of the old Create React App version and is not used by the running app."
+}

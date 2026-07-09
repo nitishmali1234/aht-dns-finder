@@ -1,0 +1,97 @@
+.hosts-table-wrapper {
+  overflow-x: auto;
+  border: 1px solid #2a3a4a;
+  border-radius: 6px;
+}
+
+.hosts-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.hosts-table thead {
+  background-color: #0f1419;
+}
+
+.hosts-table th {
+  padding: 10px 12px;
+  text-align: left;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: #667788;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid #2a3a4a;
+  white-space: nowrap;
+}
+
+.hosts-table td {
+  padding: 8px 12px;
+  color: #c8d6e5;
+  border-bottom: 1px solid #1e2d3d;
+  white-space: nowrap;
+}
+
+.hosts-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.hosts-table tbody tr:hover {
+  background-color: rgba(29, 161, 242, 0.05);
+}
+
+.hosts-table tbody tr.row-flagged {
+  background-color: rgba(241, 196, 15, 0.04);
+}
+
+.hosts-table tbody tr.row-flagged:hover {
+  background-color: rgba(241, 196, 15, 0.08);
+}
+
+.cell-name {
+  font-weight: 500;
+  color: #1da1f2;
+}
+
+.cell-ip {
+  color: #27ae60;
+}
+
+.cell-type {
+  color: #e1e8ed;
+}
+
+.cell-az {
+  color: #8899a6;
+}
+
+.cell-mem {
+  color: #f39c12;
+}
+
+.cell-flags {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.flag-badge {
+  font-size: 0.625rem;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background-color: #2a3a4a;
+  color: #8899a6;
+  white-space: nowrap;
+}
+
+.flag-badge.flag-warning {
+  background-color: rgba(241, 196, 15, 0.15);
+  color: #f1c40f;
+}
+
+.flag-badge.flag-danger {
+  background-color: rgba(231, 76, 60, 0.15);
+  color: #e74c3c;
+}
